@@ -25,6 +25,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -32,8 +35,8 @@ lgb_params = config["lgb_params"]
 
 
 CONFIG = {
-    'train_weather': ["Rain","Snow","Clouds"],
-    'test_weather': ["Clear"],
+    'source_weather': ["Rain","Snow","Clouds"],
+    'target_weather': ["Clear"],
     'random_seed': 42,
 
     'checkpoint_dir': './checkpoints_weather',
@@ -77,28 +80,28 @@ except FileNotFoundError:
 print("PART 2: DOMAIN SHIFT SPLIT (TRAIN/TEST BY weather_conditions)")
 
 
-train_weather = CONFIG['train_weather']
-test_weather = CONFIG['test_weather']
+source_weather = CONFIG['source_weather']
+target_weather = CONFIG['target_weather']
 
-train_df = df[df['weather_condition'].isin(train_weather)].copy().reset_index(drop=True)
-test_df_full = df[df['weather_condition'].isin(test_weather)].copy().reset_index(drop=True)
+source_df = df[df['weather_condition'].isin(source_weather)].copy().reset_index(drop=True)
+target_df = df[df['weather_condition'].isin(target_weather)].copy().reset_index(drop=True)
 
 
 source_domain_train, source_domain_test = train_test_split(
-    train_df, test_size=0.1, random_state=42
+    source_df, test_size=0.1, random_state=42
 )
-target_domain_train , target_domain_test = train_test_split(test_df_full,test_size=0.9,random_state=42)
+target_domain_train , target_domain_test = train_test_split(target_df,test_size=0.9,random_state=42)
 
 train_df = pd.concat([source_domain_train, target_domain_train], axis=0).sample(frac=1, random_state=42)
-test_df_full = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
+test_df = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
 
-print(f"Train weather conditions: {train_weather}")
+print(f"Train weather conditions: {source_weather}")
 print(f"Train shape: {train_df.shape}")
-print(f"\nTest weather conditions: {test_weather}")
+print(f"\nTest weather conditions: {target_weather}")
 
 
 # Verify no overlap
-#assert set(train_weather).isdisjoint(set(test_weather)), "Train/Test weather conditions overlap!"
+#assert set(source_weather).isdisjoint(set(target_weather)), "Train/Test weather conditions overlap!"
 print("✓ No overlap between train/val/test weather_conditions")
 #%%
 
@@ -127,7 +130,7 @@ try:
         if col not in categorical_cols_to_exclude:
             try:
                 train_df[col] = pd.to_numeric(train_df[col], errors='raise')
-                test_df_full[col] = pd.to_numeric(test_df_full[col], errors='raise')
+                test_df[col] = pd.to_numeric(test_df[col], errors='raise')
             except ValueError as e:
                 print(f"WARNING: Could not convert {col} to numeric: {e}")
 
@@ -135,13 +138,13 @@ try:
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
     for col in binary_nodes:
         train_df[col] = train_df[col].astype(int).astype(str)
-        test_df_full[col] = test_df_full[col].astype(int).astype(str)
+        test_df[col] = test_df[col].astype(int).astype(str)
 
     # Categorical encoding
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept"]
     for col in categorical_nodes:
         train_df[col] = train_df[col].astype(str)
-        test_df_full[col] = test_df_full[col].astype(str)
+        test_df[col] = test_df[col].astype(str)
 
     classifier_nodes = binary_nodes + categorical_nodes
     print(f"✓ Preprocessing complete (Classifier nodes: {len(classifier_nodes)})")
@@ -327,10 +330,10 @@ try:
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
 
     # Generate predictions
-    X_test = test_df_full[parents].to_numpy()
+    X_test = test_df[parents].to_numpy()
 
     train_features = parents
-    test_features = list(test_df_full[parents].columns)
+    test_features = list(test_df[parents].columns)
 
     missing = set(train_features) - set(test_features)
     extra = set(test_features) - set(train_features)
@@ -338,7 +341,7 @@ try:
     print("Missing:", missing)
     print("Extra:", extra)
 
-    if list(test_df_full[parents].columns) != parents:
+    if list(test_df[parents].columns) != parents:
         print("⚠️ Feature order mismatch!")
     else:
         print("✓ Feature order OK")
@@ -346,18 +349,21 @@ try:
     negative_percentage = (test_predictions < 0).mean() * 100
     print(negative_percentage)
     # Calculate metrics
-    mae = mean_absolute_error(test_df_full['Weekly_Sales'].values, test_predictions)
-    rmse = np.sqrt(mean_squared_error(test_df_full['Weekly_Sales'].values, test_predictions))
-    r2 = r2_score(test_df_full['Weekly_Sales'].values, test_predictions)
-    
+    mae = mean_absolute_error(test_df['Weekly_Sales'].values, test_predictions)
+    rmse = np.sqrt(mean_squared_error(test_df['Weekly_Sales'].values, test_predictions))
+    r2 = r2_score(test_df['Weekly_Sales'].values, test_predictions)
+    mape = custom_retail_mape(test_df['Weekly_Sales'].values, test_predictions)
+
     print(f"\n=== PREDICTION METRICS (Test Set) ===")
     print(f"MAE:  {mae:.2f}")
     print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}")
     print(f"R²:   {r2:.4f}")
 
-    metrics_after_adaptation = {
+    metrics = {
         'MAE': mae,
         'RMSE': rmse,
+        'MAPE': mape,
         'R2': r2
     }
 

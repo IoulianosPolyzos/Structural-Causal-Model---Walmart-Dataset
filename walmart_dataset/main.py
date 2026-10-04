@@ -30,6 +30,14 @@ data = pd.read_csv(file_path)
 
 data = create_standard_df(data, dataset_path=path)
 
+micro_sales = ((data['Weekly_Sales'] > 0) & (data['Weekly_Sales'] < 1)).sum()
+small_sales = ((data['Weekly_Sales'] >= 1) & (data['Weekly_Sales'] < 10)).sum()
+total_rows = len(data)
+
+print(f"Total rows: {total_rows}")
+print(f"Weekly Sales that are between 0 and 1 (0, 1): {micro_sales} ({(micro_sales/total_rows)*100:.2f}%)")
+print(f"Weekly Sales that are between 1 and 10 [1, 10): {small_sales} ({(small_sales/total_rows)*100:.2f}%)")
+
 #%%
 print("\ Creating enhanced features...")
 
@@ -67,6 +75,7 @@ print("\nFinal data types:")
 print(data.dtypes)
 #%%
 neg_report = check_negatives(data)
+print("Negatives")
 print(neg_report)
 #%%
 neg_cols = ['Weekly_Sales','MarkDown1','MarkDown2','MarkDown3','MarkDown4','MarkDown5']
@@ -76,6 +85,18 @@ for col in markdown_cols:
     if col in data.columns:
         data[col] = data[col].fillna(0)
 data = remove_negatives(data,neg_cols)
+
+print("Zeros:")
+zero_percent = check_zeros(data)
+
+print(zero_percent)
+
+data = data[data['Weekly_Sales'] > 0]
+
+print("Zeros after cleaning...")
+zero_percent = check_zeros(data)
+
+print(zero_percent)
 
 #%%
 print("Negatives after cleaning ...")
@@ -90,6 +111,15 @@ print(data is None)
 #%%
 data = get_city_and_weather(data)
 #%%
+
+print("Finalization:")
+micro_sales = ((data['Weekly_Sales'] > 0) & (data['Weekly_Sales'] < 1)).sum()
+small_sales = ((data['Weekly_Sales'] >= 1) & (data['Weekly_Sales'] < 10)).sum()
+total_rows = len(data)
+
+print(f"Total rows: {total_rows}")
+print(f"Weekly Sales that are between 0 and 1 (0, 1): {micro_sales} ({(micro_sales/total_rows)*100:.2f}%)")
+print(f"Weekly Sales that are between 1 and 10 [1, 10): {small_sales} ({(small_sales/total_rows)*100:.2f}%)")
 # Feature engineering
 features, target = get_features(
     data=data,
@@ -119,7 +149,7 @@ import numpy as np
 df_exp = data.copy()
 
 
-# --- 1. Store type split ---
+# --- 1. Store type.sh split ---
 df_exp['set_store_type'] = df_exp['Type'].apply(lambda x: 'train' if x == 'C' else 'test')
 
 # --- 2. Store number split ---

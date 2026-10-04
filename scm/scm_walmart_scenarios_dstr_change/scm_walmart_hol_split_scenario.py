@@ -24,6 +24,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -31,8 +34,8 @@ lgb_params = config["lgb_params"]
 
 
 CONFIG = {
-    'train_domain': 'Normal Days (IsHoliday=0)',
-    'test_domain': 'Holiday Days (IsHoliday=1)',
+    'source_domain': 'Normal Days (IsHoliday=0)',
+    'target_domain': 'Holiday Days (IsHoliday=1)',
     'random_seed': 42,
     'test_sample_size': 50000,
     'checkpoint_dir': './checkpoints_holidays',
@@ -146,22 +149,22 @@ print("PART 2: DOMAIN SHIFT SPLIT (NORMAL vs HOLIDAY)")
 # Ensure IsHoliday is numeric (0 or 1)
 df['IsHoliday'] = df['IsHoliday'].astype(int)
 
-train_df = df[df['IsHoliday'] == 0].copy().reset_index(drop=True)
-test_df_full = df[df['IsHoliday'] == 1].copy().reset_index(drop=True)
+source_df = df[df['IsHoliday'] == 0].copy().reset_index(drop=True)
+target_df = df[df['IsHoliday'] == 1].copy().reset_index(drop=True)
 
 
 source_domain_train, source_domain_test = train_test_split(
-    train_df, test_size=0.1, random_state=42
+    source_df, test_size=0.1, random_state=42
 )
-target_domain_train , target_domain_test = train_test_split(test_df_full,test_size=0.9,random_state=42)
+target_domain_train , target_domain_test = train_test_split(target_df,test_size=0.9,random_state=42)
 
 train_df = pd.concat([source_domain_train, target_domain_train], axis=0).sample(frac=1, random_state=42)
-test_df_full = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
+test_df = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
 
 
-print(f"Train domain: {CONFIG['train_domain']}")
+print(f"Source domain: {CONFIG['source_domain']}")
 print(f"Train shape: {train_df.shape}")
-print(f"\nTest domain: {CONFIG['test_domain']}")
+print(f"\nTarget domain: {CONFIG['target_domain']}")
 
 
 # Verify domain separation
@@ -185,19 +188,19 @@ try:
         if col not in categorical_cols_to_exclude:
             try:
                 train_df[col] = pd.to_numeric(train_df[col], errors='raise')
-                test_df_full[col] = pd.to_numeric(test_df_full[col], errors='raise')
+                test_df[col] = pd.to_numeric(test_df[col], errors='raise')
             except ValueError as e:
                 pass
 
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
     for col in binary_nodes:
         train_df[col] = train_df[col].astype(int).astype(str)
-        test_df_full[col] = test_df_full[col].astype(int).astype(str)
+        test_df[col] = test_df[col].astype(int).astype(str)
 
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
         train_df[col] = train_df[col].astype(str)
-        test_df_full[col] = test_df_full[col].astype(str)
+        test_df[col] = test_df[col].astype(str)
 
     classifier_nodes = binary_nodes + categorical_nodes
     print(f"✓ Preprocessing complete (Classifier nodes: {len(classifier_nodes)})")
@@ -366,7 +369,7 @@ def holiday_intervention_fn(x):
     return 1
 
 
-num_synthetic_samples = len(test_df_full)
+num_synthetic_samples = len(test_df)
 
 synthetic_dataset = gcm.interventional_samples(
     scm,
@@ -391,7 +394,7 @@ cols = [
     'MarkDown5'
 ]
 
-synthetic_dataset = synthetic_dataset[(synthetic_dataset[cols] > 0).all(axis=1)]
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
 for col in classifier_nodes:
     all_categories = df[col].astype(str).unique()
     synthetic_dataset[col] = pd.Categorical(synthetic_dataset[col].astype(str), categories=all_categories)
@@ -421,36 +424,38 @@ print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {test_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {test_df['Weekly_Sales'].std():.4f}")
 #%%
 
-print("PART 8: EVALUATION ON TEST SET (FULL)")
+print("PART 8: EVALUATION ON TEST SET")
 
 
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = test_df.drop(columns=['Weekly_Sales'])
 
 X_test = X_test[X_syn.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = test_df['Weekly_Sales']
 
 y_pred = ml_model_syn.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on test_df_full:")
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
-print(f"R²: {r2:.2f}")
+print(f"Prediction Results on Test Set")
+print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
+print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
+print(f"  - R²: {r2:.2f}")
 
 results_df = pd.DataFrame({
-    'IsHoliday': test_df_full['IsHoliday'].values,
+    'IsHoliday': test_df['IsHoliday'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -495,15 +500,14 @@ print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {test_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {test_df['Weekly_Sales'].std():.4f}")
 
 
 #%%
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = test_df.drop(columns=['Weekly_Sales'])
 
 
 
@@ -513,19 +517,22 @@ X_test = X_test[X_hybrid.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = test_df['Weekly_Sales']
 
 y_pred = ml_model_hbr.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
-print(f"\nPrediction Results:")
-print(f"Mean Absolute Error (MAE): {mae:.2f}")
-print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
-print(f"R²: {r2:.2f}")
+mape = custom_retail_mape(y_test, y_pred)
+
+print(f"Prediction Results on Test Set")
+print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
+print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
+print(f"  - R²: {r2:.2f}")
 results_df = pd.DataFrame({
-    'IsHoliday': test_df_full['IsHoliday'].values,
+    'IsHoliday': test_df['IsHoliday'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -546,19 +553,21 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
 
 adapted_metrics_holdout = evaluate_sales_on_holdout(
         scm,
-        test_df_full,
+        test_df,
         "ADAPTED SCM (after adaptation)"
     )
 
@@ -715,7 +724,7 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #TARGET - SYNTHETIC REGION ANALYSIS
 synth_df = synthetic_dataset.copy()
-target_df = test_df_full.copy()
+target_df = test_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
@@ -969,7 +978,7 @@ plt.show()
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #REAL - Hybrid REGION ANALYSIS
-real_df = df.copy()
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1097,7 +1106,7 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #Hybrid - Target REGION ANALYSIS
 hybrid_df = hybrid_dataset.copy()
-target_df = test_df_full.copy()
+target_df = test_df.copy()
 
 drop_cols = ['Weekly_Sales']
 

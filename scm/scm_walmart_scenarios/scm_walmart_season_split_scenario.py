@@ -26,6 +26,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 
 # Load experimental configuration and model hyperparameters
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
@@ -35,8 +38,8 @@ lgb_params = config["lgb_params"]
 
 # Define parameters for domain stratification and experiment tracking
 CONFIG = {
-    'train_domain': 'Normal  (Season = 1,2,4)',
-    'test_domain': 'Summer  (Season = 3)',
+    'source_domain': 'Normal  (Season = 1,2,4)',
+    'target_domain': 'Summer  (Season = 3)',
     'random_seed': 42,
     
     'checkpoint_dir': './checkpoints_Season',
@@ -150,27 +153,27 @@ print("PART 2: DOMAIN SHIFT SPLIT")
 df['Season'] = df['Season'].astype(int)
 
 # Delineate Source Domain P(X, Y) and Target Domain Q(X, Y)
-train_df = df[df['Season'].isin([1, 2, 4])].copy()
-test_df_full = df[df['Season'].isin([3])].copy()
+source_df = df[df['Season'].isin([1, 2, 4])].copy()
+target_df = df[df['Season'].isin([3])].copy()
 
 # Partition the Target Domain into an Adaptation set (for structural updating)
 # and a Holdout test set (for rigorous OOD evaluation)
 adaptation_df, holdout_test_df = train_test_split(
-    test_df_full,
-    test_size=0.20,  # ✓ 20% adaptation, 80% holdout
+    target_df,
+    test_size=0.20,
     random_state=CONFIG['random_seed']
 )
 adaptation_df = adaptation_df.reset_index(drop=True)
 holdout_test_df = holdout_test_df.reset_index(drop=True)
 
-print(f"Train domain: {CONFIG['train_domain']}")
-print(f"Train shape: {train_df.shape}")
-print(f"\nTest domain: {CONFIG['test_domain']}")
+print(f"Train domain: {CONFIG['source_domain']}")
+print(f"Train shape: {source_df.shape}")
+print(f"\nTest domain: {CONFIG['target_domain']}")
 print(f"Adaptation set shape (for refit): {adaptation_df.shape}")
 print(f"Holdout Test shape (for evaluation): {holdout_test_df.shape}")
 
 # Invariant assertion: Verify strict temporal isolation between domains
-assert (train_df['Season'].isin([1, 2, 4])).all(), "Train set contains Season = 3!"
+assert (source_df['Season'].isin([1, 2, 4])).all(), "Train set contains Season = 3!"
 assert (adaptation_df['Season'] == 3).all(), "Adaptation set contains Season = 1 2 4!"
 assert (holdout_test_df['Season'] == 3).all(), "Holdout set contains Season = 1 2 4!"
 
@@ -190,10 +193,10 @@ try:
     ]
 
     # Enforce continuous spaces for Additive Noise Models (ANM)
-    for col in train_df.columns:
+    for col in source_df.columns:
         if col not in categorical_cols_to_exclude:
             try:
-                train_df[col] = pd.to_numeric(train_df[col], errors='raise')
+                source_df[col] = pd.to_numeric(source_df[col], errors='raise')
                 adaptation_df[col] = pd.to_numeric(adaptation_df[col], errors='raise')
                 holdout_test_df[col] = pd.to_numeric(holdout_test_df[col], errors='raise')
             except ValueError as e:
@@ -203,14 +206,14 @@ try:
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season", "Is_Summer", "Is_Month_Start",
                     "Is_Month_End"]
     for col in binary_nodes:
-        train_df[col] = train_df[col].astype(int).astype(str)
+        source_df[col] = source_df[col].astype(int).astype(str)
         adaptation_df[col] = adaptation_df[col].astype(int).astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(int).astype(str)
 
     # Standardize string representations for multi-class categorical features
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
-        train_df[col] = train_df[col].astype(str)
+        source_df[col] = source_df[col].astype(str)
         adaptation_df[col] = adaptation_df[col].astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(str)
 
@@ -375,7 +378,7 @@ try:
     # Calibrate generative mechanisms against the observational Source Domain
     setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params)
     print("Fitting SCM on training data...")
-    gcm.fit(scm, train_df)
+    gcm.fit(scm, source_df)
     print("✓ Initial fit complete")
 
 except Exception as e:
@@ -450,7 +453,7 @@ def season_intervention_fn(x):
     return 3
 
 
-num_synthetic_samples = len(test_df_full)
+num_synthetic_samples = len(target_df)
 
 # Simulate P(X_do(Season=3), Y_do(Season=3)) via ancestral sampling
 synthetic_dataset = gcm.interventional_samples(
@@ -477,7 +480,7 @@ cols = [
     'MarkDown5'
 ]
 
-synthetic_dataset = synthetic_dataset[(synthetic_dataset[cols] > 0).all(axis=1)]
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
 
 # Re-aligning factor levels to ensure dimension matching between generated arrays and source sets
 for col in classifier_nodes:
@@ -506,12 +509,12 @@ print(f"  Max:  {synthetic_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {target_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {target_df['Weekly_Sales'].std():.4f}")
 # %%
 
 # =============================================================================
@@ -522,14 +525,14 @@ print("PART 10: EVALUATION ON TEST SET (FULL)")
 
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = target_df.drop(columns=['Weekly_Sales'])
 
 # Project Target domain schema to Synthetic domain schema space for inferencing compatibility
 X_test = X_test[X_syn.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = target_df['Weekly_Sales']
 
 # Formulate predictions using the syntheticly-trained empirical surrogate
 y_pred = ml_model_syn.predict(X_test)
@@ -537,10 +540,12 @@ y_pred = ml_model_syn.predict(X_test)
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on test_df_full:")
+print(f"Prediction Results on target_df:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
 # %%
@@ -552,7 +557,7 @@ print(f"  - R²: {r2:.2f}")
 print("\nHybrid Dataset (Source + Synthetic Target)...")
 
 # Generating a compounded dataset merging observational priors and causal counterfactuals
-train_aligned = train_df[synthetic_dataset.columns].copy()
+train_aligned = source_df[synthetic_dataset.columns].copy()
 
 hybrid_dataset = pd.concat([train_aligned, synthetic_dataset], ignore_index=True)
 
@@ -583,15 +588,14 @@ print(f"  Max:  {hybrid_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(hybrid_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {target_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {target_df['Weekly_Sales'].std():.4f}")
 
 # %%
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # =============================================================================
 # HYBRID MODEL EVALUATION (OOD)
@@ -599,23 +603,25 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = target_df.drop(columns=['Weekly_Sales'])
 
 # Align hybrid schema for evaluation
 X_test = X_test[X_hybrid.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = target_df['Weekly_Sales']
 
 y_pred = ml_model_hbr.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 print(f"\nPrediction Results:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
 # %%
@@ -624,11 +630,8 @@ print(f"  - R²: {r2:.2f}")
 fit_causal_model_of_target(scm, "Weekly_Sales", hybrid_dataset)
 
 
-def evaluate_sales_on_holdout(model_scm, eval_df, label):
-    """
-    Evaluate structural resilience of the target Y given its direct DAG parents 
-    within the shifted holdout strata.
-    """
+def evaluate_sales_on_test_full(model_scm, eval_df, label):
+    """Evaluate Weekly_Sales mechanism on the exact same test set."""
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
     sales_mechanism = model_scm.causal_mechanism("Weekly_Sales")
 
@@ -639,20 +642,22 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
 
 
-adapted_metrics_holdout = evaluate_sales_on_holdout(
+adapted_metrics_holdout = evaluate_sales_on_test_full(
     scm,
-    test_df_full,
+    target_df,
     "ADAPTED SCM (after adaptation)"
 )
 
@@ -828,7 +833,7 @@ from whyshift.region_analysis import shared_reweight
 
 # TARGET - SYNTHETIC REGION ANALYSIS
 synth_df = synthetic_dataset.copy()
-target_df = test_df_full.copy()
+target_df = target_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
@@ -971,7 +976,7 @@ from whyshift.region_analysis import shared_reweight
 # =============================================================================
 
 # REAL - SYNTHETIC REGION ANALYSIS
-real_df = train_df.copy()
+real_df = source_df.copy()
 target_df = synthetic_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1110,7 +1115,7 @@ from whyshift.region_analysis import shared_reweight
 # =============================================================================
 
 # REAL - Hybrid REGION ANALYSIS
-real_df = df.copy()
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1251,7 +1256,7 @@ from whyshift.region_analysis import shared_reweight
 
 # Hybrid - Target REGION ANALYSIS
 hybrid_df = hybrid_dataset.copy()
-target_df = test_df_full.copy()
+target_df = target_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
@@ -1299,6 +1304,8 @@ X_target_test = X_target[id_test_target]
 y_target_test = y_target[id_test_target]
 print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
 print(f"Features: {len(feature_names)}")
+
+model_disde = LGBMRegressor(**lgb_params)
 model_disde.fit(X_source_train, y_source_train)
 
 print("\n>>> Running Degradation Decomposition...")

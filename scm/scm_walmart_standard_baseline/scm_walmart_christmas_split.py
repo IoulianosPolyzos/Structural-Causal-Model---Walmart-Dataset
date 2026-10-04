@@ -24,6 +24,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -534,16 +537,19 @@ try:
     # Calculate metrics
     mae = mean_absolute_error(test_sample['Weekly_Sales'].values, test_predictions)
     rmse = np.sqrt(mean_squared_error(test_sample['Weekly_Sales'].values, test_predictions))
+    mape = custom_retail_mape(test_sample['Weekly_Sales'].values,test_predictions)
     r2 = r2_score(test_sample['Weekly_Sales'].values, test_predictions)
 
     print(f"\n PREDICTION METRICS (Holdout Set - After Adaptation) ")
     print(f"MAE:  {mae:.2f}")
     print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}")
     print(f"R²:   {r2:.4f}")
 
     metrics_after_adaptation = {
         'MAE': mae,
         'RMSE': rmse,
+        'MAPE': mape,
         'R2': r2
     }
 
@@ -570,13 +576,16 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "Mape": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
+
 
     return metrics
 
@@ -610,6 +619,7 @@ try:
 
     mae_delta = baseline_metrics_holdout["MAE"] - adapted_metrics_holdout["MAE"]
     rmse_delta = baseline_metrics_holdout["RMSE"] - adapted_metrics_holdout["RMSE"]
+    mape_delta = baseline_metrics_holdout["MAPE"] - adapted_metrics_holdout["MAPE"]
     r2_delta = adapted_metrics_holdout["R2"] - baseline_metrics_holdout["R2"]
 
     print(
@@ -624,6 +634,7 @@ try:
         f"{adapted_metrics_holdout['RMSE']:<15.4f} "
         f"{rmse_delta:+.4f}"
     )
+
     print(
         f"{'R2':<10} "
         f"{baseline_metrics_holdout['R2']:<15.4f} "

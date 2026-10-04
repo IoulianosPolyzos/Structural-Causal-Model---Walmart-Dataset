@@ -46,3 +46,12 @@ def check_outliers(df, columns=None):
         outlier_percent[col] = percent
 
     return pd.Series(outlier_percent)
+
+def check_zeros(df):
+    df = df.copy()
+
+    numeric_df = df.select_dtypes(include=['number'])
+
+    zero_percent = (numeric_df == 0).sum() / len(numeric_df) * 100
+
+    return zero_percent

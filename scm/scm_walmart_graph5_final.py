@@ -79,7 +79,7 @@ for col in train_df.columns:
                 print(f"WARNING: Could not convert {col} to numeric: {e}")
 
 # Define binary variables.
-# These variables are explicitly cast to string type to ensure they are treated
+# These variables are explicitly cast to string type.sh to ensure they are treated
 # as categorical variables rather than ordinal numerical values.
 binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
 
@@ -94,7 +94,7 @@ for col in binary_nodes:
 categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
 
 # Ensure consistent string typing across training and test sets.
-# This prevents type mismatches during model fitting and inference.
+# This prevents type.sh mismatches during model fitting and inference.
 for col in categorical_nodes:
     train_df[col] = train_df[col].astype(str)
     test_df[col] = test_df[col].astype(str)

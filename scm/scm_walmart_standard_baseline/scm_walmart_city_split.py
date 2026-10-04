@@ -23,6 +23,9 @@ from dowhy.gcm.fitting_sampling import fit_causal_model_of_target
 import numpy as np
 from matplotlib import pyplot as plt
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -163,7 +166,7 @@ try:
     ]
 
     # Attempt to convert all non-categorical columns to numeric format.
-    # This enforces type consistency and ensures compatibility with downstream statistical models.
+    # This enforces type.sh consistency and ensures compatibility with downstream statistical models.
     for col in train_df.columns:
         if col not in categorical_cols_to_exclude:
             try:
@@ -494,18 +497,22 @@ try:
     # Calculate metrics
     mae = mean_absolute_error(test_sample['Weekly_Sales'].values, test_predictions)
     rmse = np.sqrt(mean_squared_error(test_sample['Weekly_Sales'].values, test_predictions))
+    mape = custom_retail_mape(test_sample['Weekly_Sales'].values,test_predictions)
     r2 = r2_score(test_sample['Weekly_Sales'].values, test_predictions)
 
     print(f"\n PREDICTION METRICS (Holdout Set - After Adaptation) ")
     print(f"MAE:  {mae:.2f}")
     print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}")
     print(f"R²:   {r2:.4f}")
 
     metrics_after_adaptation = {
         'MAE': mae,
         'RMSE': rmse,
+        'MAPE': mape,
         'R2': r2
     }
+
 
 except Exception as e:
     print(f"ERROR: Test evaluation failed: {e}")
@@ -528,12 +535,14 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "Mape": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
@@ -566,6 +575,7 @@ try:
 
     mae_delta = baseline_metrics_holdout["MAE"] - adapted_metrics_holdout["MAE"]
     rmse_delta = baseline_metrics_holdout["RMSE"] - adapted_metrics_holdout["RMSE"]
+    mape_delta = baseline_metrics_holdout["MAPE"] - adapted_metrics_holdout["MAPE"]
     r2_delta = adapted_metrics_holdout["R2"] - baseline_metrics_holdout["R2"]
 
     print(

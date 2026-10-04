@@ -24,6 +24,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
@@ -31,8 +34,8 @@ lgb_params = config["lgb_params"]
 
 
 CONFIG = {
-    'train_domain': 'Normal Days (IsChristmas_Season=0)',
-    'test_domain': 'Holiday Days (Is_Christmas_Season=1)',
+    'source_domain': 'Normal Days (IsChristmas_Season=0)',
+    'target_domain': 'Holiday Days (Is_Christmas_Season=1)',
     'random_seed': 42,
     
     'checkpoint_dir': './checkpoints_Is_Christmas_Season',
@@ -47,7 +50,7 @@ Path(CONFIG['checkpoint_dir']).mkdir(exist_ok=True)
 
 def save_checkpoint(scm, feature_graph, parents, metrics, stage_name="checkpoint"):
     """
-    #Save SCM model and metadata to disk.
+    Save SCM model and metadata to disk.
 
     Args:
         scm: Fitted StructuralCausalModel
@@ -129,7 +132,7 @@ try:
     print(f"Dataset shape: {df.shape}")
     print(f"Is_Christmas_Season distribution:")
     print(f"  Normal Days (0): {(df['Is_Christmas_Season'] == 0).sum()} records")
-    print(f"  Holiday Days (1): {(df['Is_Christmas_Season'] == 1).sum()} records")
+    print(f"  Christmas Season Days (1): {(df['Is_Christmas_Season'] == 1).sum()} records")
 
 except FileNotFoundError:
     print("ERROR: Data file '/home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/final_data_walmart.csv' not found!")
@@ -146,28 +149,27 @@ print("PART 2: DOMAIN SHIFT SPLIT (NORMAL vs CHRISTMAS SEASON)")
 # Ensure Is_Christmas_Season is numeric (0 or 1)
 df['Is_Christmas_Season'] = df['Is_Christmas_Season'].astype(int)
 
-train_df = df[df['Is_Christmas_Season'] == 0].copy().reset_index(drop=True)
-test_df_full = df[df['Is_Christmas_Season'] == 1].copy().reset_index(drop=True)
+source_df = df[df['Is_Christmas_Season'] == 0].copy().reset_index(drop=True)
+target_df = df[df['Is_Christmas_Season'] == 1].copy().reset_index(drop=True)
 
 
-# We use 20% of the holiday data to learn the new concept (distribution shift),
-# and 80% to evaluate it fairly (no leakage).
+
 adaptation_df, holdout_test_df = train_test_split(
-    test_df_full,
-    test_size=0.20,  # ✓ 20% adaptation, 80% holdout
+    target_df,
+    test_size=0.20,  # 80% adaptation
     random_state=CONFIG['random_seed']
 )
 adaptation_df = adaptation_df.reset_index(drop=True)
 holdout_test_df = holdout_test_df.reset_index(drop=True)
 
-print(f"Train domain: {CONFIG['train_domain']}")
-print(f"Train shape: {train_df.shape}")
-print(f"\nTest domain: {CONFIG['test_domain']}")
+print(f"Source domain: {CONFIG['source_domain']}")
+print(f"Source shape: {source_df.shape}")
+print(f"\nTarget domain: {CONFIG['target_domain']}")
 print(f"Adaptation set shape (for refit): {adaptation_df.shape}")
 print(f"Holdout Test shape (for evaluation): {holdout_test_df.shape}")
 
 # Verify domain separation
-assert (train_df['Is_Christmas_Season'] == 0).all(), "Train set contains non-zero Is_Christmas_Season!"
+assert (source_df['Is_Christmas_Season'] == 0).all(), "Train set contains non-zero Is_Christmas_Season!"
 assert (adaptation_df['Is_Christmas_Season'] == 1).all(), "Adaptation set contains non-CHRISTMAS days!"
 assert (holdout_test_df['Is_Christmas_Season'] == 1).all(), "Holdout set contains non-CHRISTMAS days!"
 print("✓ Domain separation verified: No overlap between Normal/CHRISTMAS days")
@@ -184,10 +186,10 @@ try:
         "Store", "Dept"
     ]
 
-    for col in train_df.columns:
+    for col in source_df.columns:
         if col not in categorical_cols_to_exclude:
             try:
-                train_df[col] = pd.to_numeric(train_df[col], errors='raise')
+                source_df[col] = pd.to_numeric(source_df[col], errors='raise')
                 adaptation_df[col] = pd.to_numeric(adaptation_df[col], errors='raise')
                 holdout_test_df[col] = pd.to_numeric(holdout_test_df[col], errors='raise')
             except ValueError as e:
@@ -195,13 +197,13 @@ try:
 
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
     for col in binary_nodes:
-        train_df[col] = train_df[col].astype(int).astype(str)
+        source_df[col] = source_df[col].astype(int).astype(str)
         adaptation_df[col] = adaptation_df[col].astype(int).astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(int).astype(str)
 
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
-        train_df[col] = train_df[col].astype(str)
+        source_df[col] = source_df[col].astype(str)
         adaptation_df[col] = adaptation_df[col].astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(str)
 
@@ -340,7 +342,7 @@ def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
 try:
     setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params)
     print("Fitting SCM on training data...")
-    gcm.fit(scm, train_df)
+    gcm.fit(scm, source_df)
     print("✓ Initial fit complete")
 
 except Exception as e:
@@ -409,7 +411,7 @@ def christmas_intervention_fn(x):
     return 1
 
 
-num_synthetic_samples = len(test_df_full)
+num_synthetic_samples = len(target_df)
 
 synthetic_dataset = gcm.interventional_samples(
     scm,
@@ -434,7 +436,7 @@ cols = [
     'MarkDown5'
 ]
 
-synthetic_dataset = synthetic_dataset[(synthetic_dataset[cols] > 0).all(axis=1)]
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
 
 
 for col in classifier_nodes:
@@ -461,41 +463,44 @@ print(f"  Max:  {synthetic_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 
-print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"\nSource Domain DATA STATS :")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
-print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"\nTarget Domain STATS :")
+print(f"  Mean: {target_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {target_df['Weekly_Sales'].std():.4f}")
 #%%
 
-print("PART 10: EVALUATION ON TEST SET (FULL)")
+print("PART 10: EVALUATION ON Dtest = Dtarget (TARGET DOMAIN)")
 
 
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = target_df.drop(columns=['Weekly_Sales'])
 
 X_test = X_test[X_syn.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = target_df['Weekly_Sales']
 
 y_pred = ml_model_syn.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on test_df_full:")
+print(f"Prediction Results on Dtest = Dtarget:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
+
 results_df = pd.DataFrame({
-    'Christmas Season': test_df_full['Is_Christmas_Season'].values,
+    'Christmas Season': target_df['Is_Christmas_Season'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -506,7 +511,7 @@ print(results_df)
 print("\nHybrid Dataset (Source + Synthetic Target)...")
 
 
-train_aligned = train_df[synthetic_dataset.columns].copy()
+train_aligned = source_df[synthetic_dataset.columns].copy()
 
 hybrid_dataset = pd.concat([train_aligned, synthetic_dataset], ignore_index=True)
 
@@ -535,20 +540,19 @@ print(f"  Max:  {hybrid_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(hybrid_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 
-print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"\nSource Domain DATA STATS :")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
-print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"\nTarget Domain DATA STATS :")
+print(f"  Mean: {target_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {target_df['Weekly_Sales'].std():.4f}")
 
 
 #%%
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = target_df.drop(columns=['Weekly_Sales'])
 
 
 
@@ -558,19 +562,21 @@ X_test = X_test[X_hybrid.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = target_df['Weekly_Sales']
 
 y_pred = ml_model_hbr.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 print(f"\nPrediction Results:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 results_df = pd.DataFrame({
-    'Christmas Season': test_df_full['Is_Christmas_Season'].values,
+    'Christmas Season': target_df['Is_Christmas_Season'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -580,8 +586,8 @@ print("\nFirst 10 predictions:")
 print(results_df)
 #%%
 fit_causal_model_of_target(scm, "Weekly_Sales", hybrid_dataset)
-def evaluate_sales_on_holdout(model_scm, eval_df, label):
-    """Evaluate Weekly_Sales mechanism on the exact same holdout set."""
+def evaluate_sales_on_test_full(model_scm, eval_df, label):
+    """Evaluate Weekly_Sales mechanism on the exact same test set."""
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
     sales_mechanism = model_scm.causal_mechanism("Weekly_Sales")
 
@@ -592,19 +598,21 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
 
-adapted_metrics_holdout = evaluate_sales_on_holdout(
+adapted_metrics_holdout = evaluate_sales_on_test_full(
         scm,
-        test_df_full,
+        target_df,
         "ADAPTED SCM (after adaptation)"
     )
 
@@ -761,7 +769,7 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #TARGET - SYNTHETIC REGION ANALYSIS
 synth_df = synthetic_dataset.copy()
-target_df = test_df_full.copy()
+target_df = target_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
@@ -887,8 +895,8 @@ plt.show()
 #%%
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
-#REAL - SYNTHETIC REGION ANALYSIS
-real_df = train_df.copy()
+#REAL/SOURCE - SYNTHETIC REGION ANALYSIS
+real_df = source_df.copy()
 target_df = synthetic_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1015,7 +1023,7 @@ plt.show()
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #REAL - Hybrid REGION ANALYSIS
-real_df = df.copy()
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1143,7 +1151,7 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 #Hybrid - Target REGION ANALYSIS
 hybrid_df = hybrid_dataset.copy()
-target_df = test_df_full.copy()
+target_df = target_df.copy()
 
 drop_cols = ['Weekly_Sales']
 

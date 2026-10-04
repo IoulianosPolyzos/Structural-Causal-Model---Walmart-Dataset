@@ -1,13 +1,8 @@
 # %%
 """
-=============================================================================
-Methodology Section: Causal Modeling, Domain Adaptation, and Shift Analysis
-=============================================================================
-This script implements a complete pipeline for analyzing out-of-distribution (OOD)
-generalization using Structural Causal Models (SCMs). It covers data preparation,
-causal discovery (via predefined knowledge), domain adaptation via causal refitting,
-interventional data generation, and a rigorous performance degradation decomposition
-across source and target domains.
+This script implements a causal-based domain adaptation framework.
+It leverages Structural Causal Models (SCMs) to address distribution shifts
+(covariate and concept shifts) across different spatial domains (Store Types).
 """
 
 from dowhy.gcm.ml import SklearnClassificationModel, SklearnRegressionModel
@@ -20,10 +15,11 @@ import pickle
 from pathlib import Path
 from datetime import datetime
 
-# Suppress warnings to ensure clean standard output during experimental runs.
+# Suppress warnings to maintain clean execution logs during experimental runs
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
+# Predictive modeling and structural estimation dependencies
 from lightgbm import LGBMRegressor, LGBMClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -36,12 +32,14 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 
 
-# 1. Experimental Configuration and Hyperparameters
+# CONFIGURATION AND SETUP
 
-# Attempt to load LightGBM hyperparameters from an external configuration file.
-# If unavailable, fallback to default parameters.
+# Load experimental hyperparameters from configuration file
 try:
     with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -51,23 +49,22 @@ except FileNotFoundError:
         "No /home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml found, using default LGBM parameters.")
     lgb_params = {'n_estimators': 100, 'random_state': 42}
 
-# Define the global experimental configuration, specifically mapping the
-# source domain (train_stores) and the target domain (test_stores).
+# Define domain split parameters: Source domain (Type C) vs Target domain (Type A, B)
 CONFIG = {
-    'train_stores': list(range(1, 31)),  # Source Domain: Stores 1 to 30
-    'test_stores': list(range(31, 46)),  # Target Domain: Stores 31 to 45
+    'source_store_types': ['C'],
+    'target_store_types': ['A', 'B'],
     'random_seed': 42,
-    'checkpoint_dir': './checkpoints_store_id',
+    'checkpoint_dir': './checkpoints_type',
 }
 
-# Ensure the existence of the checkpoint directory for artifact serialization.
+# Create checkpoint directory for model serialization
 Path(CONFIG['checkpoint_dir']).mkdir(exist_ok=True)
 
 
 def save_checkpoint(scm, feature_graph, parents, metrics, stage_name="checkpoint"):
     """
-    Serializes the fitted Structural Causal Model (SCM) and corresponding
-    metadata to the disk for reproducibility and downstream analysis.
+    Serializes the SCM and its structural metadata for reproducibility
+    and multi-stage experimental pipelines.
     """
     try:
         checkpoint_dir = Path(CONFIG['checkpoint_dir'])
@@ -98,9 +95,7 @@ def save_checkpoint(scm, feature_graph, parents, metrics, stage_name="checkpoint
 
 
 def load_checkpoint(scm_path, metadata_path):
-    """
-    Deserializes a previously saved SCM and its metadata.
-    """
+    """Restores the SCM and graph structure from persistent storage."""
     try:
         with open(scm_path, "rb") as f:
             scm = pickle.load(f)
@@ -117,23 +112,21 @@ def load_checkpoint(scm_path, metadata_path):
 
 # %%
 
+
+# PART 1: DATA INGESTION
+
 print("PART 1: LOADING DATA & SETUP")
 
-
-# 2. Data Ingestion
-
-# Load the pre-aggregated dataset and drop temporal features that are either
-# redundant or potentially confounding outside of the causal framework.
 try:
+    # Load observational data and remove temporal confounders not modeled explicitly
     df = pd.read_csv("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/final_data_walmart.csv")
     df = df.drop(
         columns=["Date", "Season", "DayOfWeek", "Month", "WeekOfYear"],
         errors='ignore'
     )
-    # Zero-imputation for missing values.
-    df = df.fillna(0)
+    df = df.fillna(0)  # Zero-imputation for missing observational records
 
-    # Ensure Store identifier is an integer for robust conditional filtering.
+    # Ensure Store identifier consistency for domain stratification
     df['Store'] = pd.to_numeric(df['Store'], errors='coerce').fillna(-1).astype(int)
 
     print(f"Dataset shape: {df.shape}")
@@ -144,34 +137,28 @@ except FileNotFoundError:
         "ERROR: Data file '/home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/final_data_walmart.csv' not found!")
     raise
 
-# PART 2: SPLIT DATA BY STORES (WITH VALIDATION SET)
+
+# PART 2: DOMAIN SHIFT PARTITIONING
 
 print("\n" + "=" * 70)
-print("PART 2: DOMAIN SHIFT SPLIT (STORES 1-30 vs 31-45)")
+print("PART 2: DOMAIN SHIFT SPLIT (STORES C vs A&B)")
 
+# Stratify dataset to induce an Out-of-Distribution (OOD) scenario based on 'Type'
+source_df = df[df['Type'].isin(CONFIG['source_store_types'])]
+target_df = df[df['Type'].isin(CONFIG['target_store_types'])]
 
-# 3. Formulating the Domain Shift Problem
-
-# The dataset is partitioned into a Source Domain (train_stores) and a
-# Target Domain (test_stores) to explicitly simulate spatial domain shift.
-train_stores = CONFIG['train_stores']
-test_stores = CONFIG['test_stores']
-train_df = df[df['Store'].isin(CONFIG['train_stores'])].copy().reset_index(drop=True)
-test_df_full = df[df['Store'].isin(CONFIG['test_stores'])].copy().reset_index(drop=True)
-
-# The target domain is further split into:
-# 1. Adaptation Set: A small subset used to refit causal mechanisms (unsupervised/supervised adaptation).
-# 2. Holdout Test Set: The strictly unseen data for final empirical evaluation.
+# Partition target domain into an adaptation subset (for mechanism refitting)
+# and a strictly held-out subset (for unbiased evaluation)
 adaptation_df, holdout_test_df = train_test_split(
-    test_df_full,
+    target_df,
     test_size=0.90,
     random_state=CONFIG['random_seed']
 )
 adaptation_df = adaptation_df.reset_index(drop=True)
 holdout_test_df = holdout_test_df.reset_index(drop=True)
 
-print(f"Train domain (Stores 1-30) shape: {train_df.shape}")
-print(f"\nTest domain (Stores 31-45)")
+print(f"Source domain (Type C) shape: {source_df.shape}")
+print(f"\nTarget domain (Type A & B)")
 print(f"Adaptation set shape (for refit): {adaptation_df.shape}")
 print(f"Holdout Test shape (for evaluation): {holdout_test_df.shape}")
 
@@ -179,41 +166,40 @@ print("✓ Domain separation verified: No overlap between Store Numbers")
 
 # %%
 
+
+# PART 3: PREPROCESSING & DATA TYPING
+
 print("PART 3: PREPROCESSING")
 
-
-# 4. Feature Engineering and Type Casting
-
-# Explicitly define variables to ensure structural consistency across
-# source and target distributions before fitting the SCM.
 try:
+    # Segregate continuous from categorical variables to assign appropriate causal mechanisms
     categorical_cols_to_exclude = [
         "city", "Type", "weather_condition",
         "Store", "Dept"
     ]
 
-    # Convert non-categorical features to numeric types.
-    for col in train_df.columns:
+    # Enforce numeric types for continuous causal nodes
+    for col in source_df.columns:
         if col not in categorical_cols_to_exclude:
             try:
-                train_df[col] = pd.to_numeric(train_df[col], errors='raise')
+                source_df[col] = pd.to_numeric(source_df[col], errors='raise')
                 adaptation_df[col] = pd.to_numeric(adaptation_df[col], errors='raise')
                 holdout_test_df[col] = pd.to_numeric(holdout_test_df[col], errors='raise')
             except ValueError as e:
                 pass
 
-    # Process binary causal nodes into string formats for categorical classification.
+    # Cast boolean/binary indicators to string representations for classification mechanisms
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season", "Is_Summer", "Is_Month_Start",
                     "Is_Month_End"]
     for col in binary_nodes:
-        train_df[col] = train_df[col].astype(int).astype(str)
+        source_df[col] = source_df[col].astype(int).astype(str)
         adaptation_df[col] = adaptation_df[col].astype(int).astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(int).astype(str)
 
-    # Process multi-class categorical nodes.
+    # Cast categorical features
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
-        train_df[col] = train_df[col].astype(str)
+        source_df[col] = source_df[col].astype(str)
         adaptation_df[col] = adaptation_df[col].astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(str)
 
@@ -227,13 +213,11 @@ except Exception as e:
 # %%
 
 
+# PART 4: DIRECTED ACYCLIC GRAPH (DAG) FORMULATION
+
 print("PART 4: CAUSAL GRAPH ANALYSIS")
 
-
-# 5. Causal Discovery and Directed Acyclic Graph (DAG) Construction
-
-# We define domain knowledge-based causal groups to establish the macroscopic
-# structure of the DAG.
+# Define macro-level causal groupings based on domain knowledge
 causal_groups = {
     "Holidays": ["IsHoliday", "is_near_holiday", "Is_Christmas_Season", "holiday_proximity", "holiday_weight"],
     "Date_Features": [
@@ -256,7 +240,7 @@ causal_groups = {
     "Sales": ["Weekly_Sales"]
 }
 
-# Establish the inter-group causal dependencies (macroscopic edges).
+# Postulate structural causal edges between macro-groups
 causal_edges_groups = [
     ("Date_Features", "Season"),
     ("Date_Features", "Holidays"),
@@ -277,17 +261,14 @@ causal_edges_groups = [
     ("Economy", "Sales")
 ]
 
-# Construct the macroscopic graph to compute transitive dependencies.
+# Construct the macro-graph to infer transitive causal effects
 macro_graph = nx.DiGraph()
 macro_graph.add_nodes_from(causal_groups.keys())
 macro_graph.add_edges_from(causal_edges_groups)
 
 
 def get_all_descendants(graph, source_node):
-    """
-    Computes the transitive closure of descendants for a given node in a DAG.
-    This is critical for identifying downstream mechanisms affected by interventions.
-    """
+    """Retrieves the transitive closure of descendants for a given node."""
     descendants = set()
     to_visit = [source_node]
     visited = set()
@@ -305,7 +286,7 @@ def get_all_descendants(graph, source_node):
     return descendants
 
 
-# Identify all causal groups structurally downstream of 'Store_Features'.
+# Identify all covariates causally downstream of the domain intervention ('Store_Features')
 affected_groups = get_all_descendants(macro_graph, "Store_Features")
 affected_feature_nodes = []
 for group in affected_groups:
@@ -314,50 +295,54 @@ for group in affected_groups:
 print(f"Direct children of Store_Features: {set(macro_graph.successors('Store_Features'))}")
 print(f"All affected groups (transitive): {affected_groups}")
 
+
+# PART 5: FEATURE-LEVEL CAUSAL GRAPH
+
 print("PART 5: FEATURE-LEVEL CAUSAL GRAPH")
 
-# Unroll the macroscopic graph into a feature-level DAG for the dowhy SCM framework.
 feature_graph = nx.DiGraph()
 
+# Expand macro-groups into granular feature-level nodes
 for group_name, columns in causal_groups.items():
     for col in columns:
         feature_graph.add_node(col)
 
+# Establish directed edges across individual features based on macro-edges
 for source_group, target_group in causal_edges_groups:
     for src_col in causal_groups[source_group]:
         for tgt_col in causal_groups[target_group]:
             feature_graph.add_edge(src_col, tgt_col)
 
-# Remove direct edge from Store to Weekly_Sales to enforce mediation through other features.
-feature_graph.remove_edge('Store', 'Weekly_Sales')
+# Domain assumption: 'Type' influences sales indirectly through other store characteristics
+feature_graph.remove_edge('Type', 'Weekly_Sales')
+print("Type successors : ", list(feature_graph.successors("Type")))
 for edge in feature_graph.edges:
     print(edge)
-print("Store successors : ", list(feature_graph.successors("Store")))
-# if feature_graph.has_edge("Store", "Weekly_Sales"):
-#     feature_graph.remove_edge("Store", "Weekly_Sales")
+
 print(f"Feature-level graph: {feature_graph.number_of_nodes()} nodes, {feature_graph.number_of_edges()} edges")
 
+
+# PART 6: SCM ESTIMATION ON SOURCE DOMAIN
+
 print("PART 6: FITTING STRUCTURAL CAUSAL MODEL ON TRAINING DATA")
-
-
-# 6. SCM Mechanism Assignment and Initial Fitting
 
 scm = gcm.StructuralCausalModel(feature_graph)
 
 
 def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
     """
-    Assigns appropriate generative mechanisms to each node in the DAG:
-    - Root nodes: Empirical Marginal Distributions.
-    - Categorical internal nodes: Functional Causal Models (FCMs) using Classifiers.
-    - Continuous internal nodes: Additive Noise Models (ANMs) using Regressors.
+    Assigns non-parametric Functional Causal Models (FCMs) to each node.
+    Root nodes utilize empirical distributions, while downstream nodes are modeled
+    via Additive Noise Models (ANM) using gradient boosting estimators.
     """
     for node in feature_graph.nodes:
         parents = list(feature_graph.predecessors(node))
 
         if len(parents) == 0:
+            # Exogenous variables
             scm.set_causal_mechanism(node, gcm.EmpiricalDistribution())
         elif node in classifier_nodes:
+            # Categorical endogenous variables
             scm.set_causal_mechanism(
                 node,
                 gcm.ClassifierFCM(
@@ -365,6 +350,7 @@ def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
                 )
             )
         else:
+            # Continuous endogenous variables (ANM framework)
             scm.set_causal_mechanism(
                 node,
                 gcm.AdditiveNoiseModel(
@@ -376,8 +362,7 @@ def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
 try:
     setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params)
     print("Fitting SCM on training data...")
-    # Learn the causal mechanisms from observational data (Source Domain)
-    gcm.fit(scm, train_df)
+    gcm.fit(scm, source_df)  # Observational fitting phase
     print("✓ Initial fit complete")
 
 except Exception as e:
@@ -385,6 +370,7 @@ except Exception as e:
     raise
 
 try:
+    # Serialize the base source SCM
     scm_path_initial, metadata_path_initial = save_checkpoint(
         scm, feature_graph,
         sorted(list(feature_graph.predecessors("Weekly_Sales"))),
@@ -397,16 +383,14 @@ except Exception as e:
 # %%
 
 
+# PART 8: SUPERVISED DOMAIN ADAPTATION
+
 print("PART 8: SUPERVISED DOMAIN ADAPTATION (CONCEPT & COVARIATE SHIFT)")
 
-
-# 7. Causal Domain Adaptation
-
-# To correct for covariate and concept shifts, we selectively refit the causal
-# mechanisms of nodes that are structurally descended from the shift-inducing
-# nodes (i.e., 'Store_Features'), utilizing the sparse target adaptation set.
+# Topological sorting ensures ancestral dependencies are respected during refitting
 ordered_nodes = list(nx.topological_sort(feature_graph))
 
+# Isolate causal mechanisms vulnerable to shift based on DAG topography
 nodes_to_refit = [
     n for n in ordered_nodes
     if n in affected_feature_nodes
@@ -421,11 +405,11 @@ for node in sorted(nodes_to_refit):
 print(f"\nAdapting mechanisms to adaptation set (learning new behavior for features)...")
 
 try:
+    # Update localized mechanisms using the limited target domain adaptation set
     refit_count = 0
     for node in nodes_to_refit:
         try:
             print(f"  Refitting {node}...")
-            # Update the specific node's generative model given the target distribution.
             fit_causal_model_of_target(scm, node, adaptation_df)
             refit_count += 1
         except Exception as e:
@@ -439,25 +423,29 @@ except Exception as e:
 
 # %%
 
+
+# PART 9: COUNTERFACTUAL / SYNTHETIC TARGET DATA GENERATION
+
 print("PART 9: SYNTHETIC DATA GENERATION & ML TRAINING")
 
+train_types = ['C']
+test_types = ['A', 'B']
 
 
-# 8. Counterfactual Generation via Do-Calculus
-
-# Generate synthetic target domain data through a hard intervention on 'Store',
-# sampling from the refitted structural causal model.
-def store_intervention_fn(x):
-    return np.random.choice(range(31, 46))
+# Define soft intervention policy mapping source environments to target environments
+def type_intervention_fn(x):
+    return np.random.choice(test_types)
 
 
-num_synthetic_samples = len(test_df_full)
+num_synthetic_samples = len(target_df)
 
+# Generate interventional distributions sampling from the adapted SCM
 synthetic_dataset = gcm.interventional_samples(
     scm,
-    interventions={'Store': store_intervention_fn},
+    interventions={'Type': type_intervention_fn},
     num_samples_to_draw=num_synthetic_samples
 )
+
 print("\n>>> RAW SYNTHETIC DATA :")
 print(f"Weekly_Sales stats:")
 print(f"  Mean: {synthetic_dataset['Weekly_Sales'].mean():.4f}")
@@ -466,7 +454,7 @@ print(f"  Min:  {synthetic_dataset['Weekly_Sales'].min():.4f}")
 print(f"  Max:  {synthetic_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
-# Post-processing filter to ensure non-negativity in sales and markdowns.
+# Post-generation heuristic filtering for domain constraints (non-negative sales/markdowns)
 cols = [
     'Weekly_Sales',
     'MarkDown1',
@@ -476,10 +464,20 @@ cols = [
     'MarkDown5'
 ]
 
-synthetic_dataset = synthetic_dataset[(synthetic_dataset[cols] > 0).all(axis=1)]
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
 
-# Realign categorical topologies to match the observational training frame.
+print(f"Synthetic samples after removing negatives: {len(synthetic_dataset)}")
+print("\nFeature statistics comparison:")
+for col in ['MarkDown1', 'MarkDown2', 'Fuel_Price', 'CPI']:
+    if col in synthetic_dataset.columns:
+        print(f"\n{col}:")
+        print(f"  Synthetic: mean={synthetic_dataset[col].mean():.2f}")
+        print(f"  Test:      mean={holdout_test_df[col].mean():.2f}")
+        print(f"  Ratio:     {holdout_test_df[col].mean() / (synthetic_dataset[col].mean() + 1e-6):.2f}")
+print("\nWeekly_Sales parents:", list(feature_graph.predecessors("Weekly_Sales")))
 print("Number of parents:", feature_graph.in_degree("Weekly_Sales"))
+
+# Enforce consistent categorical levels between synthetic and observational cohorts
 for col in classifier_nodes:
     all_categories = df[col].astype(str).unique()
     synthetic_dataset[col] = pd.Categorical(synthetic_dataset[col].astype(str), categories=all_categories)
@@ -488,7 +486,7 @@ print(f"Synthetic Dataset Shape: {synthetic_dataset.shape}")
 
 print("\nTrain ML model on Synthetic Dataset...")
 
-# Train an estimator solely on the generated interventional target distribution.
+# Train surrogate predictive model optimized purely on synthetic target distribution
 X_syn = synthetic_dataset.drop(columns=['Weekly_Sales'])
 y_syn = synthetic_dataset['Weekly_Sales']
 
@@ -496,6 +494,7 @@ ml_model_syn = LGBMRegressor(**lgb_params)
 ml_model_syn.fit(X_syn, y_syn)
 # %%
 
+# Distributional sanity checks
 print("\n>>> RAW SYNTHETIC DATA :")
 print(f"Weekly_Sales stats:")
 print(f"  Mean: {synthetic_dataset['Weekly_Sales'].mean():.4f}")
@@ -505,8 +504,8 @@ print(f"  Max:  {synthetic_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
 print(f"  Mean: {holdout_test_df['Weekly_Sales'].mean():.4f}")
@@ -518,34 +517,39 @@ for col in classifier_nodes:
 
 # %%
 
-print("PART 10: EVALUATION ON TEST SET (FULL)")
 
+# PART 10: DOWNSTREAM EVALUATION (SYNTHETIC MODEL)
 
-# 9. Empirical Evaluation of Target Model
+print("PART 10: EVALUATION ON TEST SET")
 
 print("\nEvaluation on Test Set ...")
 
+# Prepare unbiased holdout set for rigorous evaluation
 X_test = holdout_test_df.drop(columns=['Weekly_Sales'])
-# Ensure strict feature alignment between the target test set and the synthetic training set.
+
 X_test = X_test[X_syn.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
 y_test = holdout_test_df['Weekly_Sales']
-# Formulate predictions and calculate error metrics.
+
+# Inference phase
 y_pred = ml_model_syn.predict(X_test)
 
+# Metric compilation
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on holdout_test_df:")
+print(f"Prediction Results on Test Set:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
 results_df = pd.DataFrame({
-    'Store': holdout_test_df['Store'].values,
+    'Type': holdout_test_df['Type'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -553,14 +557,14 @@ results_df = pd.DataFrame({
 print("\nFirst 10 predictions:")
 print(results_df)
 # %%
+
+
+# HYBRID DATASET FORMULATION
+
 print("\nHybrid Dataset (Source + Synthetic Target)...")
 
-
-# 10. Augmentation Strategy: Hybrid Data Formulation
-
-# Combine observational source domain data with interventional synthetic data
-# to leverage source knowledge while increasing target domain density.
-train_aligned = train_df[synthetic_dataset.columns].copy()
+# Combine factual source observations with synthetic counterfactuals to augment support
+train_aligned = source_df[synthetic_dataset.columns].copy()
 
 hybrid_dataset = pd.concat([train_aligned, synthetic_dataset], ignore_index=True)
 
@@ -576,9 +580,11 @@ y_hybrid = hybrid_dataset['Weekly_Sales']
 print("\nTraining ML Model on Hybrid Dataset...")
 ml_model_hbr = LGBMRegressor(**lgb_params)
 
+# Train hybrid robust model
 ml_model_hbr.fit(X_hybrid, y_hybrid)
 # %%
 
+# Hybrid cohort validation
 print("\n>>> RAW HYBRID DATA :")
 print(f"Weekly_Sales stats:")
 print(f"  Mean: {hybrid_dataset['Weekly_Sales'].mean():.4f}")
@@ -588,37 +594,38 @@ print(f"  Max:  {hybrid_dataset['Weekly_Sales'].max():.4f}")
 print(f"  % negative: {(hybrid_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
 print(f"  Mean: {holdout_test_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {holdout_test_df['Weekly_Sales'].std():.4f}")
 
 # %%
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
 print("\nEvaluation on Test Set ...")
 
 X_test = holdout_test_df.drop(columns=['Weekly_Sales'])
 
-# Evaluate the augmented hybrid model on the true target holdout set.
 X_test = X_test[X_hybrid.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
 y_test = holdout_test_df['Weekly_Sales']
+
+# Evaluate hybrid regressor generalization
 y_pred = ml_model_hbr.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 print(f"\nPrediction Results:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 results_df = pd.DataFrame({
-    'Store': holdout_test_df['Store'].values,
+    'Type': holdout_test_df['Type'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -626,14 +633,17 @@ results_df = pd.DataFrame({
 print("\nFirst 10 predictions:")
 print(results_df)
 # %%
-
 # %%
-# Validate the inherent mechanism properties of the adapted SCM.
+
+# Refit the direct target mechanism for diagnostic bounds
 fit_causal_model_of_target(scm, "Weekly_Sales", hybrid_dataset)
 
 
 def evaluate_sales_on_holdout(model_scm, eval_df, label):
-    """Evaluate Weekly_Sales mechanism on the exact same holdout set."""
+    """
+    Evaluates the inherent NP-SEM predicting Sales purely
+    based on its structural parents.
+    """
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
     sales_mechanism = model_scm.causal_mechanism("Weekly_Sales")
 
@@ -644,12 +654,14 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
@@ -662,12 +674,13 @@ adapted_metrics_holdout = evaluate_sales_on_holdout(
 )
 
 # %%
+# %%
 from sklearn.model_selection import KFold
 from xgboost import XGBClassifier
 
 
 
-# 11. Distributional Shift Decomposition & Calibration Analysis
+# DEGRADATION DECOMPOSITION & DIAGNOSTICS
 
 def degradation_decomp_regression(
         source_X,
@@ -680,24 +693,21 @@ def degradation_decomp_regression(
         domain_classifier=None, draw_calibration=False, save_calibration_png='calibration.png'
 ):
     """
-    Decomposes the performance degradation between source and target domains into
-    covariate shift (X-shift) and concept shift (Y|X-shift).
-
-    Utilizes importance weighting via a domain discriminator (binary classification
-    between source and target covariates) across K-folds to prevent overfitting.
+    Decomposes the out-of-distribution (OOD) performance gap into components
+    attributable to Covariate Shift (X-shift) and Concept Shift (Y|X-shift).
+    Uses density ratio estimation via a probabilistic classifier.
     """
-    # Downsample target data to prevent memory bottleneck / speed up cross-val.
     perm1 = np.random.permutation(target_X_raw.shape[0])
     target_X = target_X_raw[perm1[:data_sum], :]
     target_y = target_y_raw[perm1[:data_sum]]
 
-    # Initialize propensity vectors.
     piA = np.zeros(source_X.shape[0])
     piB = np.zeros(target_X.shape[0])
 
     permA = np.random.permutation(source_X.shape[0])
     permB = np.random.permutation(target_X.shape[0])
 
+    # K-fold cross-fitting to mitigate overfitting in density ratio estimation
     kf = KFold(n_splits=K, shuffle=False)
 
     A_train_index_list, A_test_index_list = [], []
@@ -711,8 +721,8 @@ def degradation_decomp_regression(
         B_train_index_list.append(train_idx)
         B_test_index_list.append(test_idx)
 
-    # Perform K-Fold cross-prediction to get out-of-sample propensities.
     for i in range(K):
+        # Concatenate folds for domain discriminator training
         trainX = np.concatenate([
             source_X[permA[A_train_index_list[i]]],
             target_X[permB[B_train_index_list[i]]]
@@ -728,6 +738,7 @@ def degradation_decomp_regression(
 
         clf.fit(trainX, trainT)
 
+        # Estimate propensity scores Pr(Domain=Target | X)
         piA[permA[A_test_index_list[i]]] = clf.predict_proba(
             source_X[permA[A_test_index_list[i]]]
         )[:, 1]
@@ -739,29 +750,28 @@ def degradation_decomp_regression(
     if draw_calibration:
         plot_calibration(piA, piB, save_dir=save_calibration_png)
 
-    # Calculate dataset imbalance ratio.
+    # Calculate density ratios (Importance Weights)
     alpha = target_X.shape[0] / (source_X.shape[0] + target_X.shape[0])
 
-    # Construct the importance weights via Bayes' Rule formulation.
     wA = piA / ((1 - alpha) * piA + alpha * (1 - piA))
     wB = (1 - piB) / ((1 - alpha) * piB + alpha * (1 - piB))
 
+    # Normalize weights
     wA /= np.sum(wA)
     wB /= np.sum(wB)
 
-    # Acquire raw model predictions across both domains.
+    # Compute empirical losses
     pred_source = model.predict(source_X)
     pred_target = model.predict(target_X)
 
-    # Compute individual loss mappings (L1 norms).
     loss_source = np.abs(pred_source - source_y)
     loss_target = np.abs(pred_target - target_y)
 
-    # Compute empirical risks on source (errorA/p2p) and target (errorB/q2q).
+    # Empirical risk limits
     errorA = np.mean(loss_source)
     errorB = np.mean(loss_target)
 
-    # Compute weighted risks indicative of expected performance post-reweighting.
+    # Importance-weighted risk estimators (approximating target integration)
     sx_A = np.dot(wA, loss_source)
     sx_B = np.dot(wB, loss_target)
 
@@ -771,10 +781,7 @@ def degradation_decomp_regression(
 def plot_calibration(prop_p, prop_q, nbins=20, p_weights=None, q_weights=None,
                      nanmask_threshold=0.01, name='Prop Score',
                      save_dir='.', balance=False):
-    """
-    Visualizes the calibration density curves of the domain discriminator.
-    Crucial for assessing the reliability of the calculated importance weights.
-    """
+    """Generates reliability diagrams for the domain discrimination classifier."""
     fig, ax = plt.subplots(1, 3, figsize=(10, 4))
     for i in range(3):
         ax[i].set_box_aspect(1)
@@ -833,10 +840,9 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 
 
-# 12. Region Analysis: Synthetic versus Target Domain
+# REGION ANALYSIS 1: TARGET vs SYNTHETIC COVARIATE GEOMETRY
 
-# Explores specific feature spaces (regions) where models demonstrate severe
-# discrepancy via an surrogate Decision Tree mapping risk divergence.
+# Identifies disjoint sub-regions in the feature space causing maximum performance divergence
 synth_df = synthetic_dataset.copy()
 target_df = holdout_test_df.copy()
 
@@ -845,8 +851,7 @@ drop_cols = ['Weekly_Sales']
 X_syn = synth_df.drop(columns=drop_cols)
 X_target = target_df.drop(columns=drop_cols)
 
-# ONE HOT ENCODING (CRITICAL)
-# OHE applied jointly to ensure dimensionality alignment across datasets.
+# ONE HOT ENCODING (CRITICAL) - Map to contiguous representation for Tree Estimators
 combined = pd.concat([X_syn, X_target], axis=0)
 combined_encoded = pd.get_dummies(combined, columns=categorical_nodes)
 
@@ -887,7 +892,6 @@ print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
 print(f"Features: {len(feature_names)}")
 
 
-# Initial fit on source domain to quantify expected degradation.
 model_disde = LGBMRegressor(**lgb_params)
 model_disde.fit(X_source_train, y_source_train)
 
@@ -902,7 +906,7 @@ reg_domain_classifier = LGBMClassifier(
     eval_metric='logloss'
 )
 
-# Extract shift statistics bridging P (Synthetic) and Q (True Target).
+# Decompose model error to isolate covariate structural vulnerabilities
 p2p, q2q, p2s, s2q = degradation_decomp_regression(
     X_source_full, y_source_full,
     X_target, y_target,
@@ -928,7 +932,7 @@ print(f"X shift (P) is p2p-p2s :{(p2p - p2s):.4f}")
 print(f"X shift (Q) is s2q-q2q :{(s2q - q2q):.4f}")
 print("-" * 45)
 
-# Calculate optimal instance weighting to homogenize distributions prior to tree analysis.
+# Project density ratios to induce balanced covariate alignment
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
 source_model = LGBMRegressor(**lgb_params)
@@ -937,9 +941,10 @@ source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
 
-# Isolate divergent predictions to represent localized risk factors.
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
+
+# Calculate model disagreement indicative of epistemic uncertainty
 new_Y = np.abs(pred_src - pred_tgt)
 
 print("\n>>> Model MAE Comparison:")
@@ -956,7 +961,7 @@ print(
 print(
     f"Target model MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
 
-# Train surrogate tree regressor to hierarchically isolate the maximum risk regions.
+# Fit regression tree on disagreements to extract explicit interpretable risk regions
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -968,7 +973,7 @@ plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
 
-plt.savefig("TARGET - SYNTHETIC Store REGION ANALYSIS.png")
+plt.savefig("TARGET - SYNTHETIC TYPE REGION ANALYSIS.png")
 plt.show()
 
 # %%
@@ -976,11 +981,9 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 
 
-# 13. Region Analysis: Real Source versus Synthetic Target
+# REGION ANALYSIS 2: REAL SOURCE vs SYNTHETIC COVARIATE GEOMETRY
 
-# Repeating decomposition methodology between observational source and causal
-# synthetic outputs to validate the efficacy of interventional mapping.
-real_df = train_df.copy()
+real_df = source_df.copy()
 target_df = synthetic_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1043,6 +1046,7 @@ reg_domain_classifier = LGBMClassifier(
     eval_metric='logloss'
 )
 
+# Analyze structural divergence imposed by the NP-SEM synthetic generating process
 p2p, q2q, p2s, s2q = degradation_decomp_regression(
     X_source_full, y_source_full,
     X_target, y_target,
@@ -1070,11 +1074,10 @@ print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
 source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
@@ -1093,7 +1096,6 @@ print(
     f"Model trained on Synthetic data MAE on ID real data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(
     f"Model trained on Synthetic data MAE on OOD synthetic data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1104,7 +1106,7 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
-plt.savefig("STORE REAL training - SYNTHETIC  REGION ANALYSIS.png")
+plt.savefig("TYPE REAL training - SYNTHETIC  REGION ANALYSIS.png")
 plt.show()
 
 # %%
@@ -1112,11 +1114,9 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 
 
-# 14. Region Analysis: Real Distribution versus Hybrid Alignment
+# REGION ANALYSIS 3: REAL SOURCE vs HYBRID COVARIATE GEOMETRY
 
-# Examines the smoothing effect of data augmentation, analyzing the structural
-# shift when transitioning from purely observational data to the hybrid dataset.
-real_df = df.copy()
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1179,6 +1179,7 @@ reg_domain_classifier = LGBMClassifier(
     eval_metric='logloss'
 )
 
+# Quantify regularization provided by the hybrid support expansion strategy
 p2p, q2q, p2s, s2q = degradation_decomp_regression(
     X_source_full, y_source_full,
     X_target, y_target,
@@ -1206,11 +1207,10 @@ print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
 source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
@@ -1229,7 +1229,6 @@ print(
     f"Hybrid model:  MAE on real data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(
     f"Hybrid model:  MAE on hybrid data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1240,7 +1239,7 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
-plt.savefig("ALL_REAL_HYBRID_STORE_tree.png")
+plt.savefig("ALL_REAL_HYBRID_TYPE_tree.png")
 plt.show()
 
 # %%
@@ -1248,10 +1247,8 @@ from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
 
 
-# 15. Region Analysis: Hybrid (Augmented) versus True Target
+# REGION ANALYSIS 4: HYBRID vs TARGET COVARIATE GEOMETRY
 
-# Final degradation check computing the ultimate generalizability gap
-# closing between the hybrid estimator and true OOD target data.
 hybrid_df = hybrid_dataset.copy()
 target_df = holdout_test_df.copy()
 
@@ -1300,7 +1297,6 @@ y_target_test = y_target[id_test_target]
 print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
 print(f"Features: {len(feature_names)}")
 print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
-
 model_disde = LGBMRegressor(**lgb_params)
 model_disde.fit(X_source_train, y_source_train)
 
@@ -1315,6 +1311,7 @@ reg_domain_classifier = LGBMClassifier(
     eval_metric='logloss'
 )
 
+# Assess final generalizability improvements across domains
 p2p, q2q, p2s, s2q = degradation_decomp_regression(
     X_source_full, y_source_full,
     X_target, y_target,
@@ -1343,11 +1340,10 @@ print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
 source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
@@ -1367,6 +1363,7 @@ print(
 print(
     f"Target model MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
 
+# Produce final localized risk estimates
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1377,5 +1374,5 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
-plt.savefig("hybrid_target_STORE.png")
+plt.savefig("hybrid_target_TYPE.png")
 plt.show()

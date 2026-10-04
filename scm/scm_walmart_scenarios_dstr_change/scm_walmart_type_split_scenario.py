@@ -1,11 +1,4 @@
 #%%
-
-# CAUSAL DOMAIN ADAPTATION AND DISTRIBUTION SHIFT DECOMPOSITION FRAMEWORK
-# This script implements a Structural Causal Model (SCM) to analyze and mitigate
-# performance degradation caused by domain shifts (specifically weather-induced shifts)
-# in retail sales forecasting.
-
-
 from dowhy.gcm.ml import SklearnClassificationModel, SklearnRegressionModel
 
 #!/usr/bin/env python3
@@ -16,7 +9,6 @@ import pickle
 from pathlib import Path
 from datetime import datetime
 
-# Suppress warnings to maintain clean execution logs during iterative modeling
 os.environ["PYTHONWARNINGS"] = "ignore"
 warnings.filterwarnings("ignore")
 
@@ -32,10 +24,10 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 
-
-# HYPERPARAMETER CONFIGURATION & INITIALIZATION
-# Load experimental parameters for the underlying LightGBM estimators.
 
 try:
     with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
@@ -45,24 +37,19 @@ except FileNotFoundError:
     print("No /home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml found, using default LGBM parameters.")
     lgb_params = {'n_estimators': 100, 'random_state': 42}
 
-# Define the source (train) and target (test) distributions for the domain shift.
-# The shift is induced via a specific exogenous variable: 'weather_condition'.
-CONFIG = {
-    'train_weather': ["Rain","Snow","Clouds"],
-    'test_weather': ["Clear"],
-    'random_seed': 42,
-    'test_sample_size': 100000,
-    'checkpoint_dir': './checkpoints_weather',
-}
 
-# Create checkpoint directory for model serialization
+CONFIG = {
+    'source_store_types': ['C'],
+    'target_store_types': ['A', 'B'],
+    'random_seed': 42,
+    'test_sample_size': 50000,
+    'checkpoint_dir': './checkpoints_type',
+}
+# Create checkpoint directory
 Path(CONFIG['checkpoint_dir']).mkdir(exist_ok=True)
 
 def save_checkpoint(scm, feature_graph, parents, metrics, stage_name="checkpoint"):
-    """
-    Serialize and store the fitted Structural Causal Model and its associated
-    Directed Acyclic Graph (DAG) metadata for reproducibility and downstream analysis.
-    """
+    """Save SCM model and metadata to disk."""
     try:
         checkpoint_dir = Path(CONFIG['checkpoint_dir'])
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -91,9 +78,7 @@ def save_checkpoint(scm, feature_graph, parents, metrics, stage_name="checkpoint
         raise
 
 def load_checkpoint(scm_path, metadata_path):
-    """
-    Restore the SCM and its topological metadata from disk.
-    """
+    """Load SCM model and metadata from disk."""
     try:
         with open(scm_path, "rb") as f:
             scm = pickle.load(f)
@@ -109,66 +94,63 @@ def load_checkpoint(scm_path, metadata_path):
 
 #%%
 
+
 print("PART 1: LOADING DATA & SETUP")
 
-# Load the empirical dataset and perform initial variable selection.
-# Temporal index variables are dropped to focus on purely cross-sectional causal relationships.
+
 try:
     df = pd.read_csv("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/final_data_walmart.csv")
     df = df.drop(
         columns=["Date","Season","DayOfWeek","Month","WeekOfYear"],
         errors='ignore'
     )
-    df = df.fillna(0)  # Employing zero-imputation strategy as predetermined
+    df = df.fillna(0)
+
+    # Ensure Store is an integer for correct filtering
+    df['Store'] = pd.to_numeric(df['Store'], errors='coerce').fillna(-1).astype(int)
 
     print(f"Dataset shape: {df.shape}")
-    print(f"Unique cities: {df['weather_condition'].nunique()}")
-    print(f"Cities: {sorted(df['weather_condition'].unique())}")
+    print(f"Stores present: {sorted(df['Store'].unique())}")
 
 except FileNotFoundError:
     print("ERROR: Data file '/home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/final_data_walmart.csv' not found!")
     raise
 
 
-# PART 2: SPLIT DATA BY CITIES (WITH VALIDATION SET)
 
-print("PART 2: DOMAIN SHIFT SPLIT (TRAIN/TEST BY weather_conditions)")
+# PART 2: SPLIT DATA BY STORES (WITH VALIDATION SET)
 
-# Construct the Out-of-Distribution (OOD) scenarios.
-# The training dataset represents the source domain P(X, Y).
-# The testing dataset represents the target domain Q(X, Y) subjected to covariate shift.
-train_weather = CONFIG['train_weather']
-test_weather = CONFIG['test_weather']
 
-train_df = df[df['weather_condition'].isin(train_weather)].copy().reset_index(drop=True)
-test_df_full = df[df['weather_condition'].isin(test_weather)].copy().reset_index(drop=True)
+print("PART 2: DOMAIN SHIFT SPLIT (STORES C vs A&B)")
 
-# Isolate an adaptation set from the target domain to facilitate unsupervised or
-# semi-supervised mechanism updating during the adaptation phase.
-adaptation_df, holdout_test_df = train_test_split(
-    test_df_full,
-    test_size=0.20,
-    random_state=CONFIG['random_seed']
+
+# Split based on Store Number
+source_df = df[df['Type'].isin(CONFIG['source_store_types'])]
+target_df = df[df['Type'].isin(CONFIG['target_store_types'])]
+
+
+
+
+source_domain_train, source_domain_test = train_test_split(
+    source_df, test_size=0.1, random_state=42
 )
-adaptation_df = adaptation_df.reset_index(drop=True)
-holdout_test_df = holdout_test_df.reset_index(drop=True)
+target_domain_train , target_domain_test = train_test_split(target_df,test_size=0.9,random_state=42)
 
-print(f"Train weather conditions: {train_weather}")
-print(f"Train shape: {train_df.shape}")
-print(f"\nTest weather conditions: {test_weather}")
-print(f"Adaptation set shape (for refit): {adaptation_df.shape}")
-print(f"Holdout Test shape (for evaluation): {holdout_test_df.shape}")
+train_df = pd.concat([source_domain_train, target_domain_train], axis=0).sample(frac=1, random_state=42)
+test_df = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
 
-# Ensure strict segregation between source and target observational distributions.
-assert set(train_weather).isdisjoint(set(test_weather)), "Train/Test weather conditions overlap!"
-print("✓ No overlap between train/val/test weather_conditions")
+
+print(f"Train domain (Type C) shape: {train_df.shape}")
+print(f"\nTest domain (Type A & B)")
+
+
+print("✓ Domain separation verified: No overlap between Store Numbers")
 
 #%%
 
 print("PART 3: PREPROCESSING")
 
-# Standardize data types across all partitions to prevent structural discrepancies
-# during categorical encoding and causal mechanism fitting.
+
 try:
     categorical_cols_to_exclude = [
         "city", "Type", "weather_condition",
@@ -179,22 +161,19 @@ try:
         if col not in categorical_cols_to_exclude:
             try:
                 train_df[col] = pd.to_numeric(train_df[col], errors='raise')
-                adaptation_df[col] = pd.to_numeric(adaptation_df[col], errors='raise')
-                holdout_test_df[col] = pd.to_numeric(holdout_test_df[col], errors='raise')
+                test_df[col] = pd.to_numeric(test_df[col], errors='raise')
             except ValueError as e:
                 pass
 
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
     for col in binary_nodes:
         train_df[col] = train_df[col].astype(int).astype(str)
-        adaptation_df[col] = adaptation_df[col].astype(int).astype(str)
-        holdout_test_df[col] = holdout_test_df[col].astype(int).astype(str)
+        test_df[col] = test_df[col].astype(int).astype(str)
 
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
         train_df[col] = train_df[col].astype(str)
-        adaptation_df[col] = adaptation_df[col].astype(str)
-        holdout_test_df[col] = holdout_test_df[col].astype(str)
+        test_df[col] = test_df[col].astype(str)
 
     classifier_nodes = binary_nodes + categorical_nodes
     print(f"✓ Preprocessing complete (Classifier nodes: {len(classifier_nodes)})")
@@ -205,10 +184,10 @@ except Exception as e:
 
 #%%
 
+
 print("PART 4: CAUSAL GRAPH ANALYSIS")
 
-# Define the macroscopic causal architecture utilizing domain knowledge.
-# Variables are clustered into semantically cohesive groups to streamline edge definition.
+
 causal_groups = {
     "Holidays": ["IsHoliday", "is_near_holiday", "Is_Christmas_Season", "holiday_proximity", "holiday_weight"],
     "Date_Features": [
@@ -231,7 +210,6 @@ causal_groups = {
     "Sales": ["Weekly_Sales"]
 }
 
-# Formalize the directed acyclic graph (DAG) edges at the macroscopic level.
 causal_edges_groups = [
     ("Date_Features", "Season"),
     ("Date_Features", "Holidays"),
@@ -248,17 +226,15 @@ causal_edges_groups = [
     ("City", "Sales"),
     ("Store_Features", "Sales"),
     ("Store_Features", "MarkDowns"),
-    #("Weather", "Sales"),
+    ("Weather", "Sales"),
     ("Economy", "Sales")
 ]
 
-# Instantiate the macroscopic graph using NetworkX.
 macro_graph = nx.DiGraph()
 macro_graph.add_nodes_from(causal_groups.keys())
 macro_graph.add_edges_from(causal_edges_groups)
 
 def get_all_descendants(graph, source_node):
-    """Retrieve all transitive descendants of a given node in the DAG."""
     descendants = set()
     to_visit = [source_node]
     visited = set()
@@ -275,20 +251,18 @@ def get_all_descendants(graph, source_node):
 
     return descendants
 
-# Identify all downstream nodes causally dependent on 'Weather'.
-# This is critical for targeted mechanism refitting during domain adaptation.
-affected_groups = get_all_descendants(macro_graph, "Weather")
+affected_groups = get_all_descendants(macro_graph, "Store_Features")
 affected_feature_nodes = []
 for group in affected_groups:
     affected_feature_nodes.extend(causal_groups[group])
 
-print(f"Direct children of Weather: {set(macro_graph.successors('Weather'))}")
+print(f"Direct children of Store_Features: {set(macro_graph.successors('Store_Features'))}")
 print(f"All affected groups (transitive): {affected_groups}")
 
 
 print("PART 5: FEATURE-LEVEL CAUSAL GRAPH")
 
-# Unroll the macroscopic graph into a granular feature-level DAG suitable for the SCM.
+
 feature_graph = nx.DiGraph()
 
 for group_name, columns in causal_groups.items():
@@ -299,22 +273,20 @@ for source_group, target_group in causal_edges_groups:
     for src_col in causal_groups[source_group]:
         for tgt_col in causal_groups[target_group]:
             feature_graph.add_edge(src_col, tgt_col)
-
+print("Type successors : ",list(feature_graph.successors("Type")))
+for edge in feature_graph.edges:
+    print(edge)
+# if feature_graph.has_edge("Store", "Weekly_Sales"):
+#     feature_graph.remove_edge("Store", "Weekly_Sales")
 print(f"Feature-level graph: {feature_graph.number_of_nodes()} nodes, {feature_graph.number_of_edges()} edges")
 
 
 print("PART 6: FITTING STRUCTURAL CAUSAL MODEL ON TRAINING DATA")
 
-# Initialize the DoWhy SCM with the constructed DAG.
+
 scm = gcm.StructuralCausalModel(feature_graph)
 
 def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
-    """
-    Assign appropriate functional causal mechanisms to each node.
-    - Root nodes: Empirical distributions.
-    - Categorical downstream nodes: Classifier Functional Causal Models (FCM).
-    - Continuous downstream nodes: Additive Noise Models (ANM) using regressors.
-    """
     for node in feature_graph.nodes:
         parents = list(feature_graph.predecessors(node))
 
@@ -338,7 +310,7 @@ def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
 try:
     setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params)
     print("Fitting SCM on training data...")
-    gcm.fit(scm, train_df) # Estimate functional relationships from empirical source data.
+    gcm.fit(scm, train_df)
     print("✓ Initial fit complete")
 
 except Exception as e:
@@ -355,70 +327,62 @@ try:
 except Exception as e:
     print(f"ERROR: Could not save checkpoint: {e}")
 
+
 #%%
 
-print("PART 8: SUPERVISED DOMAIN ADAPTATION (CONCEPT & COVARIATE SHIFT)")
 
-# Execute causal mechanism adaptation to address distributional shifts.
-# We exclusively refit nodes that are causally downstream of the intervention target
-# (weather_condition) using the limited adaptation set.
-ordered_nodes = list(nx.topological_sort(feature_graph))
-
-nodes_to_refit = [
-    n for n in ordered_nodes
-    if n in affected_feature_nodes and n != "Weekly_Sales"
-]
-nodes_to_refit = list(nodes_to_refit)
-
-print(f"\nNodes to refit (Features ONLY - {len(nodes_to_refit)} nodes):")
-for node in sorted(nodes_to_refit):
-    print(f"  ✓ {node}")
-
-print(f"\nAdapting mechanisms to adaptation set (learning new behavior for features)...")
-
-try:
-    refit_count = 0
-    for node in nodes_to_refit:
-        try:
-            print(f"  Refitting {node}...")
-            fit_causal_model_of_target(scm, node, adaptation_df)
-            refit_count += 1
-        except Exception as e:
-            print(f"WARNING: Failed to refit {node}: {e}")
-
-    print(f"\n✓ Concept shift adaptation complete ({refit_count}/{len(nodes_to_refit)} nodes)")
-
-except Exception as e:
-    print(f"ERROR: Domain adaptation failed: {e}")
-    raise
 
 
 #%%
 
-print("PART 9: SYNTHETIC DATA GENERATION & ML TRAINING")
+print("PART 7: SYNTHETIC DATA GENERATION & ML TRAINING")
 
-# Define the causal intervention: do(weather_condition = 'Clear').
-def weather_intervention_fn(x):
-    return 'Clear'
+train_types = ['C']
+test_types = ['A', 'B']
+def type_intervention_fn(x):
+    return np.random.choice(test_types)
 
-num_synthetic_samples = len(test_df_full)
 
-# Generate counterfactual/interventional samples based on the adapted SCM.
+
+num_synthetic_samples = len(test_df)
+
 synthetic_dataset = gcm.interventional_samples(
     scm,
-    interventions={'weather_condition': weather_intervention_fn},
+    interventions={'Type': type_intervention_fn},
     num_samples_to_draw=num_synthetic_samples
 )
 
-# Re-align categorical levels to maintain consistency with the original domain schema.
+print("\n>>> RAW SYNTHETIC DATA :")
+print(f"Weekly_Sales stats:")
+print(f"  Mean: {synthetic_dataset['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {synthetic_dataset['Weekly_Sales'].std():.4f}")
+print(f"  Min:  {synthetic_dataset['Weekly_Sales'].min():.4f}")
+print(f"  Max:  {synthetic_dataset['Weekly_Sales'].max():.4f}")
+print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
+
+cols = [
+    'Weekly_Sales',
+    'MarkDown1',
+    'MarkDown2',
+    'MarkDown3',
+    'MarkDown4',
+    'MarkDown5'
+]
+
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
+
+print("Number of parents:", feature_graph.in_degree("Weekly_Sales"))
+
+# Are important features included?
+# If very few parents → the model has insufficient signal
 for col in classifier_nodes:
     all_categories = df[col].astype(str).unique()
     synthetic_dataset[col] = pd.Categorical(synthetic_dataset[col].astype(str), categories=all_categories)
 
 print(f"Synthetic Dataset Shape: {synthetic_dataset.shape}")
+
 print("\nTrain ML model on Synthetic Dataset...")
 
-# Train a discriminative estimator solely on the generated synthetic target data.
 X_syn = synthetic_dataset.drop(columns=['Weekly_Sales'])
 y_syn = synthetic_dataset['Weekly_Sales']
 
@@ -440,8 +404,8 @@ print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {test_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {test_df['Weekly_Sales'].std():.4f}")
 #%%
 for col in classifier_nodes:
     all_categories = df[col].astype(str).unique()
@@ -450,32 +414,34 @@ for col in classifier_nodes:
 # ---------------------------
 #%%
 
-print("PART 10: EVALUATION ON TEST SET (FULL)")
+print("PART 8: EVALUATION ON TEST SET")
 
-# Evaluate the predictive performance of the synthetic-trained model on empirical target data.
+
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = test_df.drop(columns=['Weekly_Sales'])
 
 X_test = X_test[X_syn.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = test_df['Weekly_Sales']
 
 y_pred = ml_model_syn.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on test_df_full:")
+print(f"Prediction Results on Test Set")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
 results_df = pd.DataFrame({
-    'Weather': test_df_full['weather_condition'].values,
+    'Type': test_df['Type'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -485,8 +451,7 @@ print(results_df)
 #%%
 print("\nHybrid Dataset (Source + Synthetic Target)...")
 
-# Construct a hybrid augmented dataset leveraging both source empirical data
-# and target interventional representations to enhance generalization.
+
 train_aligned = train_df[synthetic_dataset.columns].copy()
 
 hybrid_dataset = pd.concat([train_aligned, synthetic_dataset], ignore_index=True)
@@ -502,6 +467,7 @@ y_hybrid = hybrid_dataset['Weekly_Sales']
 
 print("\nTraining ML Model on Hybrid Dataset...")
 ml_model_hbr = LGBMRegressor(**lgb_params)
+
 
 ml_model_hbr.fit(X_hybrid, y_hybrid)
 #%%
@@ -520,33 +486,39 @@ print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
-print(f"  Mean: {test_df_full['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {test_df_full['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {test_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {test_df['Weekly_Sales'].std():.4f}")
 
 
 #%%
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 print("\nEvaluation on Test Set ...")
 
-X_test = test_df_full.drop(columns=['Weekly_Sales'])
+X_test = test_df.drop(columns=['Weekly_Sales'])
+
+
+
+
 
 X_test = X_test[X_hybrid.columns]
 for col in classifier_nodes:
     if col in X_test.columns:
         X_test[col] = pd.Categorical(X_test[col].astype(str), categories=X_syn[col].cat.categories)
-y_test = test_df_full['Weekly_Sales']
+y_test = test_df['Weekly_Sales']
 
 y_pred = ml_model_hbr.predict(X_test)
 
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
-print(f"\nPrediction Results:")
+mape = custom_retail_mape(y_test, y_pred)
+
+print(f"Prediction Results on Test Set")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 results_df = pd.DataFrame({
-    'Weather': test_df_full['weather_condition'].values,
+    'Type': test_df['Type'].values,
     'Actual_Sales': y_test.values,
     'Predicted_Sales': y_pred
 }).head(10)
@@ -554,12 +526,10 @@ results_df = pd.DataFrame({
 print("\nFirst 10 predictions:")
 print(results_df)
 #%%
-# Directly fit the structural equation for Weekly_Sales using the hybrid dataset
-# and validate the updated mechanism.
+#%%
 fit_causal_model_of_target(scm, "Weekly_Sales", hybrid_dataset)
-
 def evaluate_sales_on_holdout(model_scm, eval_df, label):
-    """Evaluate Weekly_Sales structural mechanism strictly on the independent holdout set."""
+    """Evaluate Weekly_Sales mechanism on the exact same holdout set."""
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
     sales_mechanism = model_scm.causal_mechanism("Weekly_Sales")
 
@@ -570,30 +540,29 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
 
 adapted_metrics_holdout = evaluate_sales_on_holdout(
         scm,
-        test_df_full,
+        test_df,
         "ADAPTED SCM (after adaptation)"
     )
 
+
+#%%
 #%%
 from sklearn.model_selection import KFold
 from xgboost import XGBClassifier
-
-
-# DISTRIBUTION SHIFT DECOMPOSITION (DISDE)
-# This module attributes performance degradation into component errors:
-# Covariate Shift (X-shift) and Concept Shift (Y|X-shift), via importance weighting.
 
 
 def degradation_decomp_regression(
@@ -606,15 +575,12 @@ def degradation_decomp_regression(
     K=8,
     domain_classifier=None,draw_calibration=False, save_calibration_png='calibration.png'
 ):
-    """
-    Decompose empirical risk across domains using density ratio estimation.
-    Computes expected error under source (p2p), target (q2q), and reweighted configurations.
-    """
+
     perm1 = np.random.permutation(target_X_raw.shape[0])
     target_X = target_X_raw[perm1[:data_sum], :]
     target_y = target_y_raw[perm1[:data_sum]]
 
-    # Initialize propensity vectors for density ratio estimation
+
     piA = np.zeros(source_X.shape[0])
     piB = np.zeros(target_X.shape[0])
 
@@ -634,7 +600,6 @@ def degradation_decomp_regression(
         B_train_index_list.append(train_idx)
         B_test_index_list.append(test_idx)
 
-    # Train a domain classifier iteratively using cross-validation to derive P(Target|X)
     for i in range(K):
         trainX = np.concatenate([
             source_X[permA[A_train_index_list[i]]],
@@ -663,25 +628,24 @@ def degradation_decomp_regression(
         plot_calibration(piA, piB, save_dir=save_calibration_png)
     alpha = target_X.shape[0] / (source_X.shape[0] + target_X.shape[0])
 
-    # Compute stabilized importance weights w(x) = dP_target(x)/dP_source(x)
     wA = piA / ((1 - alpha) * piA + alpha * (1 - piA))
     wB = (1 - piB) / ((1 - alpha) * piB + alpha * (1 - piB))
 
     wA /= np.sum(wA)
     wB /= np.sum(wB)
 
-    # Evaluate predictive error mapping
+
     pred_source = model.predict(source_X)
     pred_target = model.predict(target_X)
 
     loss_source = np.abs(pred_source - source_y)
     loss_target = np.abs(pred_target - target_y)
 
-    # Compute empirical marginal risks
+    # empirical risks
     errorA = np.mean(loss_source)
     errorB = np.mean(loss_target)
 
-    # Compute synthetically reweighted risks simulating covariate matching
+    # weighted risks
     sx_A = np.dot(wA, loss_source)
     sx_B = np.dot(wB, loss_target)
 
@@ -690,9 +654,7 @@ def degradation_decomp_regression(
 def plot_calibration(prop_p, prop_q, nbins=20, p_weights=None, q_weights=None,
                      nanmask_threshold=0.01, name='Prop Score',
                      save_dir='.', balance=False):
-    """
-    Visualize domain classifier calibration to validate the density ratio estimates.
-    """
+
     fig,ax=plt.subplots(1,3,figsize=(10,4))
     for i in range(3):
         ax[i].set_box_aspect(1)
@@ -715,6 +677,8 @@ def plot_calibration(prop_p, prop_q, nbins=20, p_weights=None, q_weights=None,
     bin_mids = (bin_edges[1:]+bin_edges[:-1])/2
 
     nanmask = np.where(conf_scores < nanmask_threshold, np.nan, 1)
+    # print(bin_mids)
+    # print(nanmask * conf_scores / (conf_scores + conf_scores[::-1]))
     ax[0].plot(bin_mids, nanmask * conf_scores / (conf_scores + conf_scores[::-1]), color='green')
     ax[0].set_ylim(0,1)
     ax[0].set_ylabel('Proportion correct')
@@ -746,20 +710,16 @@ def plot_calibration(prop_p, prop_q, nbins=20, p_weights=None, q_weights=None,
 #%%
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
-
-
-# DISDE ANALYSIS 1: TARGET vs SYNTHETIC REGION
-
+#TARGET - SYNTHETIC REGION ANALYSIS
 synth_df = synthetic_dataset.copy()
-target_df = test_df_full.copy()
+target_df = test_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
 X_syn = synth_df.drop(columns=drop_cols)
 X_target  = target_df.drop(columns=drop_cols)
 
-# Apply One-Hot Encoding to categorical structures to facilitate regression
-# and decision tree interpretability.
+# ONE HOT ENCODING (CRITICAL)
 combined = pd.concat([X_syn, X_target], axis=0)
 combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
 
@@ -814,7 +774,6 @@ reg_domain_classifier = LGBMClassifier(
     eval_metric='logloss'
 )
 
-# Extract error terms to partition observed discrepancy into covariate/concept elements.
 p2p, q2q, p2s, s2q = degradation_decomp_regression(
     X_source_full, y_source_full,
     X_target, y_target,
@@ -841,26 +800,26 @@ print(f"X shift (Q) is s2q-q2q :{(s2q-q2q):.4f}")
 print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
-# Assess localized risk regions by regressing over discrepancies.
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model = LGBMRegressor(**lgb_params)
+
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
 new_Y = np.abs(pred_src - pred_tgt)
 
 print("\n>>> Model MAE Comparison:")
+
+# Model trained on Synthetic data
 print(f"Model trained on Synthetic data: MAE on Synthetic data test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
 print(f"Model trained on Synthetic data MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
 
+# Target model
 print(f"Target model MAE on Synthetic data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(f"Target model MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
-# Train DecisionTree to pinpoint sub-populations with maximal model disagreement.
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -871,41 +830,15 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
+
+plt.savefig("TARGET - SYNTHETIC TYPE REGION ANALYSIS.png")
 plt.show()
 
-# Visualize aggregated distribution shift components.
-fig, ax = plt.subplots(figsize=(10, 6))
 
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
-
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: Weather Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()
 #%%
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
-
-
-# DISDE ANALYSIS 2: REAL vs SYNTHETIC REGION
-
+#REAL - SYNTHETIC REGION ANALYSIS
 real_df = train_df.copy()
 target_df = synthetic_dataset.copy()
 
@@ -914,7 +847,7 @@ drop_cols = ['Weekly_Sales']
 X = real_df.drop(columns=drop_cols)
 X_target  = target_df.drop(columns=drop_cols)
 
-# Align encoding spaces across distributions
+# ONE HOT ENCODING (CRITICAL)
 combined = pd.concat([X, X_target], axis=0)
 combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
 
@@ -929,7 +862,7 @@ X_target = X_target_enc.values
 y_source_full = real_df['Weekly_Sales'].values
 y_target = target_df['Weekly_Sales'].values
 
-# Stratify samples for ID/OOD cross-validation
+
 np.random.seed(42)
 perm = np.random.permutation(len(X_source_full))
 train_idx = perm[:int(0.7 * len(X_source_full))]
@@ -995,23 +928,26 @@ print(f"X shift (Q) is s2q-q2q :{(s2q-q2q):.4f}")
 print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model = LGBMRegressor(**lgb_params)
+
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
 new_Y = np.abs(pred_src - pred_tgt)
 
 print("\n>>> Model MAE Comparison:")
+
+# Model trained on real training data
 print(f"Model trained on real training data MAE on ID real data test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
 print(f"Model trained on real training data MAE on OOD synthetic data test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
+
+# Target model
 print(f"Model trained on Synthetic data MAE on ID real data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(f"Model trained on Synthetic data MAE on OOD synthetic data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1022,40 +958,15 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
+plt.savefig("TYPE REAL training - SYNTHETIC  REGION ANALYSIS.png")
 plt.show()
 
-fig, ax = plt.subplots(figsize=(10, 6))
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
 
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: Weather Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()
 #%%
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
-
-
-# DISDE ANALYSIS 3: REAL vs HYBRID REGION
-
-real_df = df.copy()
+#REAL - Hybrid REGION ANALYSIS
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1063,7 +974,7 @@ drop_cols = ['Weekly_Sales']
 X = real_df.drop(columns=drop_cols)
 X_target  = target_df.drop(columns=drop_cols)
 
-# Apply dummy variables globally to ensure dimension stability
+# ONE HOT ENCODING (CRITICAL)
 combined = pd.concat([X, X_target], axis=0)
 combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
 
@@ -1144,23 +1055,26 @@ print(f"X shift (Q) is s2q-q2q :{(s2q-q2q):.4f}")
 print("-" * 45)
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model = LGBMRegressor(**lgb_params)
+
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
 new_Y = np.abs(pred_src - pred_tgt)
 
 print("\n>>> Model MAE Comparison:")
+
+# Source model
 print(f"Model trained on real data: MAE on real data test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
 print(f"Model trained on real data: MAE on hybrid data test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
+
+# Target model
 print(f"Hybrid model:  MAE on real data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(f"Hybrid model:  MAE on hybrid data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1171,49 +1085,23 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
-plt.savefig("hybrid_synthetic_tree.png")
+plt.savefig("ALL_REAL_HYBRID_TYPE_tree.png")
 plt.show()
 
-fig, ax = plt.subplots(figsize=(10, 6))
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
 
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: Weather Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()
 #%%
 from sklearn.tree import plot_tree, DecisionTreeRegressor
 from whyshift.region_analysis import shared_reweight
-
-
-# DISDE ANALYSIS 4: HYBRID vs TARGET REGION
-
+#Hybrid - Target REGION ANALYSIS
 hybrid_df = hybrid_dataset.copy()
-target_df = test_df_full.copy()
+target_df = test_df.copy()
 
 drop_cols = ['Weekly_Sales']
 
 X = hybrid_dataset.drop(columns=drop_cols)
 X_target  = target_df.drop(columns=drop_cols)
 
-# Align categorical feature encoding
+# ONE HOT ENCODING (CRITICAL)
 combined = pd.concat([X, X_target], axis=0)
 combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
 
@@ -1251,8 +1139,9 @@ y_train_target = y_target[train_target]
 
 X_target_test = X_target[id_test_target]
 y_target_test = y_target[id_test_target]
-print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
 print(f"Features: {len(feature_names)}")
+print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
+model_disde = LGBMRegressor(**lgb_params)
 model_disde.fit(X_source_train, y_source_train)
 
 print("\n>>> Running Degradation Decomposition...")
@@ -1293,23 +1182,26 @@ print("-" * 45)
 
 wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
 
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 
+source_model = LGBMRegressor(**lgb_params)
+
+source_model.fit(X_source_train, y_source_train, sample_weight=wA)
 target_model = LGBMRegressor(**lgb_params)
 target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
 pred_src = source_model.predict(new_X)
 pred_tgt = target_model.predict(new_X)
 
 new_Y = np.abs(pred_src - pred_tgt)
 
 print("\n>>> Model MAE Comparison:")
+
+# Source model
 print(f"Hybrid model MAE on hybrid data test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
 print(f"Hybrid model MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
+
+# Target model
 print(f"Target model MAE on hybrid data test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
 print(f"Target model MAE on Real (OOD) Target Domain data test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
 region_tree = DecisionTreeRegressor(
     max_depth=4,
     min_samples_leaf=100,
@@ -1320,327 +1212,7 @@ region_tree.fit(new_X, new_Y, sample_weight=new_weights)
 plt.figure(figsize=(25, 12))
 plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
 plt.title("Risk Regions (Prediction Disagreement)")
+plt.savefig("hybrid_target_TYPE.png")
 plt.show()
 
-fig, ax = plt.subplots(figsize=(10, 6))
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
-
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: Weather Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()
 #%%
-from sklearn.tree import plot_tree, DecisionTreeRegressor
-from whyshift.region_analysis import shared_reweight
-from whyshift.disde import degradation_decomp
-
-
-# DISDE ANALYSIS 5: HYBRID ID vs HYBRID OOD
-
-df_hyb = hybrid_dataset.copy()
-
-drop_cols = ['Weekly_Sales']
-source_weather = CONFIG['train_weather']
-target_weather = CONFIG['test_weather']
-source_df = df_hyb[df_hyb['weather_condition'].isin(source_weather)].copy()
-target_df = df_hyb[df_hyb['weather_condition'].isin(target_weather)].copy()
-
-X = source_df.drop(columns=drop_cols)
-X_target  = target_df.drop(columns=drop_cols)
-
-# Uniform categorical encoding application
-combined = pd.concat([X, X_target], axis=0)
-combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
-
-X_enc = combined_encoded.iloc[:len(X)]
-X_target_enc  = combined_encoded.iloc[len(X):]
-
-feature_names = X_enc.columns.tolist()
-
-X_source_full = X_enc.values
-X_target = X_target_enc.values
-
-y_source_full = source_df['Weekly_Sales'].values
-y_target = target_df['Weekly_Sales'].values
-
-
-np.random.seed(42)
-perm = np.random.permutation(len(X_source_full))
-train_idx = perm[:int(0.7 * len(X_source_full))]
-id_test_idx = perm[int(0.7 * len(X_source_full)):]
-
-X_source_train = X_source_full[train_idx]
-y_source_train = y_source_full[train_idx]
-
-X_source_test = X_source_full[id_test_idx]
-y_source_test = y_source_full[id_test_idx]
-
-print(f"Features: {len(feature_names)}")
-np.random.seed(42)
-perm = np.random.permutation(len(X_target))
-train_target = perm[:int(0.7 * len(X_target))]
-id_test_target = perm[int(0.7 * len(X_target)):]
-
-X_train_target = X_target[train_target]
-y_train_target = y_target[train_target]
-
-X_target_test = X_target[id_test_target]
-y_target_test = y_target[id_test_target]
-print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
-print(f"Features: {len(feature_names)}")
-
-model_disde = LGBMRegressor(**lgb_params)
-model_disde.fit(X_source_train, y_source_train)
-
-model_disde = LGBMRegressor(**lgb_params)
-model_disde.fit(X_source_train, y_source_train)
-
-print("\n>>> Running Degradation Decomposition...")
-reg_domain_classifier = LGBMClassifier(
-    n_estimators=100,
-    max_depth=5,
-    learning_rate=0.05,
-    random_state=42,
-    class_weight='balanced',
-    use_label_encoder=False,
-    eval_metric='logloss'
-)
-
-p2p, q2q, p2s, s2q = degradation_decomp_regression(
-    X_source_full, y_source_full,
-    X_target, y_target,
-    model_disde,
-    data_sum=20000,
-    K=8,
-    domain_classifier=reg_domain_classifier,
-    draw_calibration=True,
-)
-
-print("-" * 45)
-print(f"Total Performance Degradation (p2p - q2q): {p2p - q2q:.4f}")
-print(f"Proportion of Y|X-shift:                  {(p2s - s2q) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift:                  {(p2p - p2s + s2q - q2q) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift Q side:                  {(p2p - p2s) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift P side:                  {(s2q - q2q) / (p2p - q2q):.4f}")
-print(f"p2p: accuracy on source domain is:{p2p:.4f}")
-print(f"q2q: accuracy on target domain is:{q2q:.4f}")
-print(f"p2s: expected Source accuracy on Sx (Reweighted Source Accuracy)  : {p2s:.4f}")
-print(f"s2q: expected Target accuracy on Sx (Reweighted Target Accuracy)  : {s2q:.4f}")
-print(f"Y|X shift is p2s-s2q :{(p2s-s2q):.4f}")
-print(f"X shift (P) is p2p-p2s :{(p2p-p2s):.4f}")
-print(f"X shift (Q) is s2q-q2q :{(s2q-q2q):.4f}")
-print("-" * 45)
-
-
-wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
-
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
-
-target_model = LGBMRegressor(**lgb_params)
-target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
-pred_src = source_model.predict(new_X)
-pred_tgt = target_model.predict(new_X)
-
-new_Y = np.abs(pred_src - pred_tgt)
-
-print("\n>>> Model MAE Comparison:")
-print(f"Source model MAE on ID test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
-print(f"Source model MAE on OOD test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
-print(f"Target model MAE on ID test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
-print(f"Target model MAE on OOD test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
-region_tree = DecisionTreeRegressor(
-    max_depth=4,
-    min_samples_leaf=100,
-    min_weight_fraction_leaf=0.05
-)
-
-region_tree.fit(new_X, new_Y, sample_weight=new_weights)
-plt.figure(figsize=(25, 12))
-plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
-plt.title("Risk Regions (Prediction Disagreement)")
-plt.show()
-
-fig, ax = plt.subplots(figsize=(10, 6))
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
-
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: Weather Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()
-#%%
-from sklearn.tree import plot_tree, DecisionTreeRegressor
-from whyshift.region_analysis import shared_reweight
-
-
-# DISDE ANALYSIS 6: STANDARD EMPIRICAL REGIONS (SOURCE ID vs TARGET OOD)
-
-real_df = train_df.copy()
-target_df = test_df_full.copy()
-
-drop_cols = ['Weekly_Sales']
-
-X = real_df.drop(columns=drop_cols)
-X_target  = target_df.drop(columns=drop_cols)
-
-# Enforce consistent categorical dimensionality via one-hot encoding
-combined = pd.concat([X, X_target], axis=0)
-combined_encoded = pd.get_dummies(combined,columns=categorical_nodes)
-X_enc = combined_encoded.iloc[:len(X)]
-X_target_enc  = combined_encoded.iloc[len(X):]
-
-feature_names = X_enc.columns.tolist()
-
-X_source_full = X_enc.values
-X_target = X_target_enc.values
-
-y_source_full = real_df['Weekly_Sales'].values
-y_target = target_df['Weekly_Sales'].values
-
-
-np.random.seed(42)
-perm = np.random.permutation(len(X_source_full))
-train_idx = perm[:int(0.7 * len(X_source_full))]
-id_test_idx = perm[int(0.7 * len(X_source_full)):]
-
-X_source_train = X_source_full[train_idx]
-y_source_train = y_source_full[train_idx]
-
-X_source_test = X_source_full[id_test_idx]
-y_source_test = y_source_full[id_test_idx]
-
-print(f"Features: {len(feature_names)}")
-np.random.seed(42)
-perm = np.random.permutation(len(X_target))
-train_target = perm[:int(0.7 * len(X_target))]
-id_test_target = perm[int(0.7 * len(X_target)):]
-
-X_train_target = X_target[train_target]
-y_train_target = y_target[train_target]
-
-X_target_test = X_target[id_test_target]
-y_target_test = y_target[id_test_target]
-print(f"Source test: {len(X_source_test)} | Target: {len(X_target_test)}")
-print(f"Features: {len(feature_names)}")
-
-model_disde = LGBMRegressor(**lgb_params)
-model_disde.fit(X_source_train, y_source_train)
-
-print("\n>>> Running Degradation Decomposition...")
-reg_domain_classifier = LGBMClassifier(**lgb_params)
-
-p2p, q2q, p2s, s2q = degradation_decomp_regression(
-    X_source_full, y_source_full,
-    X_target, y_target,
-    model_disde,
-    data_sum=20000,
-    K=8,
-    domain_classifier=reg_domain_classifier,
-    draw_calibration=True,
-)
-
-print("-" * 45)
-print(f"Total Performance Degradation (p2p - q2q): {p2p - q2q:.4f}")
-print(f"Proportion of Y|X-shift:                  {(p2s - s2q) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift:                  {(p2p - p2s + s2q - q2q) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift Q side:                  {(p2p - p2s) / (p2p - q2q):.4f}")
-print(f"Proportion of X-shift P side:                  {(s2q - q2q) / (p2p - q2q):.4f}")
-print(f"p2p: accuracy on source domain is:{p2p:.4f}")
-print(f"q2q: accuracy on target domain is:{q2q:.4f}")
-print(f"p2s: expected Source accuracy on Sx (Reweighted Source Accuracy)  : {p2s:.4f}")
-print(f"s2q: expected Target accuracy on Sx (Reweighted Target Accuracy)  : {s2q:.4f}")
-print(f"Y|X shift is p2s-s2q :{(p2s-s2q):.4f}")
-print(f"X shift (P) is p2p-p2s :{(p2p-p2s):.4f}")
-print(f"X shift (Q) is s2q-q2q :{(s2q-q2q):.4f}")
-print("-" * 45)
-wA, wB, new_X, new_weights = shared_reweight(X_source_train, X_train_target, K=8)
-
-source_model = LGBMRegressor(**lgb_params)
-source_model.fit(X_source_train, y_source_train, sample_weight=wA)
-
-target_model = LGBMRegressor(**lgb_params)
-target_model.fit(X_train_target, y_train_target, sample_weight=wB)
-
-pred_src = source_model.predict(new_X)
-pred_tgt = target_model.predict(new_X)
-
-new_Y = np.abs(pred_src - pred_tgt)
-
-print("\n>>> Model MAE Comparison:")
-print(f"Source model MAE on ID test:  {mean_absolute_error(y_source_test, source_model.predict(X_source_test)):.4f}")
-print(f"Source model MAE on OOD test: {mean_absolute_error(y_target_test, source_model.predict(X_target_test)):.4f}")
-print(f"Target model MAE on ID test:  {mean_absolute_error(y_source_test, target_model.predict(X_source_test)):.4f}")
-print(f"Target model MAE on OOD test: {mean_absolute_error(y_target_test, target_model.predict(X_target_test)):.4f}")
-
-region_tree = DecisionTreeRegressor(
-    max_depth=4,
-    min_samples_leaf=100,
-    min_weight_fraction_leaf=0.05
-)
-
-region_tree.fit(new_X, new_Y, sample_weight=new_weights)
-plt.figure(figsize=(25, 12))
-plot_tree(region_tree, filled=True, feature_names=feature_names, fontsize=10)
-plt.title("Risk Regions (Prediction Disagreement)")
-plt.show()
-
-fig, ax = plt.subplots(figsize=(10, 6))
-base_val = min(p2p, q2q)
-max_val = max(p2p, q2q)
-gap = max_val - base_val
-
-shift_y = abs(p2s - s2q)
-shift_p = abs(p2p - p2s)
-shift_q = abs(s2q - q2q)
-total_shift = shift_y + shift_p + shift_q + 1e-9
-
-norm_y = (shift_y / total_shift) * gap
-norm_p = (shift_p / total_shift) * gap
-norm_q = (shift_q / total_shift) * gap
-
-ax.bar(["Source", "Target"], [p2p, q2q], color='blue', alpha=0.5)
-ax.bar(["Decomposition"], [norm_y], bottom=base_val, color='orange', label="Concept Shift (Y|X)")
-ax.bar(["Decomposition"], [norm_p], bottom=base_val + norm_y, color='#AA0000', label="Covariate Shift (X) (P)")
-ax.bar(["Decomposition"], [norm_q], bottom=base_val + norm_y + norm_p, color='red', label="Covariate Shift (X) (Q)")
-
-ax.set_title("Walmart Sales: City Decomposition (Regression DISDE)")
-ax.set_ylabel("MAE")
-ax.legend()
-plt.tight_layout()
-plt.show()

@@ -29,6 +29,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 
 # [Configuration Initialization] Load hyperparameter bindings from external configuration
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
@@ -38,8 +41,8 @@ lgb_params = config["lgb_params"]
 
 # [Experimental Setup] Define domain boundaries and reproducibility constraints
 CONFIG = {
-    'train_domain': 'Normal Days (IsHoliday=0)',
-    'test_domain': 'Holiday Days (IsHoliday=1)',
+    'source_domain': 'Normal Days (IsHoliday=0)',
+    'target_domain': 'Holiday Days (IsHoliday=1)',
     'random_seed': 42,
     'checkpoint_dir': './checkpoints_holidays',
 }
@@ -149,28 +152,28 @@ print("PART 2: DOMAIN SHIFT SPLIT (NORMAL vs HOLIDAY)")
 # and the target domain (IsHoliday=1) to evaluate OOD generalization.
 df['IsHoliday'] = df['IsHoliday'].astype(int)
 
-train_df = df[df['IsHoliday'] == 0].copy().reset_index(drop=True)
-test_df_full = df[df['IsHoliday'] == 1].copy().reset_index(drop=True)
+source_df = df[df['IsHoliday'] == 0].copy().reset_index(drop=True)
+target_df = df[df['IsHoliday'] == 1].copy().reset_index(drop=True)
 
 # [Test-Time Adaptation Set Formulation]
 # Segment the target domain into an adaptation cohort (for covariate refitting)
 # and a strictly held-out evaluation cohort.
 adaptation_df, holdout_test_df = train_test_split(
-    test_df_full,
+    target_df,
     test_size=0.90,
     random_state=CONFIG['random_seed']
 )
 adaptation_df = adaptation_df.reset_index(drop=True)
 holdout_test_df = holdout_test_df.reset_index(drop=True)
 
-print(f"Train domain: {CONFIG['train_domain']}")
-print(f"Train shape: {train_df.shape}")
-print(f"\nTest domain: {CONFIG['test_domain']}")
+print(f"Source domain: {CONFIG['source_domain']}")
+print(f"Source shape: {source_df.shape}")
+print(f"\nTarget domain: {CONFIG['target_domain']}")
 print(f"Adaptation set shape (for refit): {adaptation_df.shape}")
 print(f"Holdout Test shape (for evaluation): {holdout_test_df.shape}")
 
 # Verify domain separation bounds
-assert (train_df['IsHoliday'] == 0).all(), "Train set contains non-zero IsHoliday!"
+assert (source_df['IsHoliday'] == 0).all(), "Train set contains non-zero IsHoliday!"
 assert (adaptation_df['IsHoliday'] == 1).all(), "Adaptation set contains non-holiday days!"
 assert (holdout_test_df['IsHoliday'] == 1).all(), "Holdout set contains non-holiday days!"
 print("✓ Domain separation verified: No overlap between Normal/Holiday days")
@@ -187,10 +190,10 @@ try:
         "Store", "Dept"
     ]
 
-    for col in train_df.columns:
+    for col in source_df.columns:
         if col not in categorical_cols_to_exclude:
             try:
-                train_df[col] = pd.to_numeric(train_df[col], errors='raise')
+                source_df[col] = pd.to_numeric(source_df[col], errors='raise')
                 adaptation_df[col] = pd.to_numeric(adaptation_df[col], errors='raise')
                 holdout_test_df[col] = pd.to_numeric(holdout_test_df[col], errors='raise')
             except ValueError as e:
@@ -199,14 +202,14 @@ try:
     # Standardize binary indicators
     binary_nodes = ["IsHoliday", "is_near_holiday", "Is_Christmas_Season","Is_Summer","Is_Month_Start","Is_Month_End"]
     for col in binary_nodes:
-        train_df[col] = train_df[col].astype(int).astype(str)
+        source_df[col] = source_df[col].astype(int).astype(str)
         adaptation_df[col] = adaptation_df[col].astype(int).astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(int).astype(str)
 
     # Standardize multi-class nominal features
     categorical_nodes = ["Type", "weather_condition", "Store", "Dept", "city"]
     for col in categorical_nodes:
-        train_df[col] = train_df[col].astype(str)
+        source_df[col] = source_df[col].astype(str)
         adaptation_df[col] = adaptation_df[col].astype(str)
         holdout_test_df[col] = holdout_test_df[col].astype(str)
 
@@ -357,7 +360,7 @@ def setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params):
 try:
     setup_mechanisms(scm, feature_graph, classifier_nodes, lgb_params)
     print("Fitting SCM on training data...")
-    gcm.fit(scm, train_df)
+    gcm.fit(scm, source_df)
     print("✓ Initial fit complete")
 
 except Exception as e:
@@ -423,7 +426,7 @@ def holiday_intervention_fn(x):
     return 1
 
 
-num_synthetic_samples = len(test_df_full)
+num_synthetic_samples = len(target_df)
 
 synthetic_dataset = gcm.interventional_samples(
     scm,
@@ -450,7 +453,7 @@ cols = [
 ]
 
 # Physical bounds constraint: filter invalid simulated dynamics
-synthetic_dataset = synthetic_dataset[(synthetic_dataset[cols] > 0).all(axis=1)]
+synthetic_dataset[cols] = synthetic_dataset[cols].clip(lower=0)
 
 # Categorical space reconciliation
 for col in classifier_nodes:
@@ -481,15 +484,15 @@ print(f"  % negative: {(synthetic_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}
 
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
 print(f"  Mean: {holdout_test_df['Weekly_Sales'].mean():.4f}")
 print(f"  Std:  {holdout_test_df['Weekly_Sales'].std():.4f}")
 #%%
 
-print("PART 10: EVALUATION ON TEST SET (FULL)")
+print("PART 10: EVALUATION ON TEST SET")
 
 # [Empirical Evaluation in the Target Domain]
 print("\nEvaluation on Test Set ...")
@@ -508,10 +511,12 @@ y_pred = ml_model_syn.predict(X_test)
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
+mape = custom_retail_mape(y_test, y_pred)
 
-print(f"Prediction Results on holdout_test_df:")
+print(f"Prediction Results on Test Set:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 
 results_df = pd.DataFrame({
@@ -529,7 +534,7 @@ print(results_df)
 print("\nHybrid Dataset (Source + Synthetic Target)...")
 
 
-train_aligned = train_df[synthetic_dataset.columns].copy()
+train_aligned = source_df[synthetic_dataset.columns].copy()
 
 hybrid_dataset = pd.concat([train_aligned, synthetic_dataset], ignore_index=True)
 
@@ -560,8 +565,8 @@ print(f"  % negative: {(hybrid_dataset['Weekly_Sales'] < 0).mean() * 100:.2f}%")
 
 
 print(f"\nTRAIN DATA STATS :")
-print(f"  Mean: {train_df['Weekly_Sales'].mean():.4f}")
-print(f"  Std:  {train_df['Weekly_Sales'].std():.4f}")
+print(f"  Mean: {source_df['Weekly_Sales'].mean():.4f}")
+print(f"  Std:  {source_df['Weekly_Sales'].std():.4f}")
 
 print(f"\nTESTDATA STATS :")
 print(f"  Mean: {holdout_test_df['Weekly_Sales'].mean():.4f}")
@@ -570,7 +575,6 @@ print(f"  Std:  {holdout_test_df['Weekly_Sales'].std():.4f}")
 
 #%%
 # [Hybrid Model Performance Validation]
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 print("\nEvaluation on Test Set ...")
 
 X_test = holdout_test_df.drop(columns=['Weekly_Sales'])
@@ -590,9 +594,12 @@ y_pred = ml_model_hbr.predict(X_test)
 mae = mean_absolute_error(y_test, y_pred)
 rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
-print(f"\nPrediction Results:")
+mape = custom_retail_mape(y_test, y_pred)
+
+print(f"Prediction Results on Test Set:")
 print(f"  - Mean Absolute Error (MAE): {mae:.2f}")
 print(f"  - Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"  - Mean Absolute Percentage Error (MAPE): {mape:.2f}")
 print(f"  - R²: {r2:.2f}")
 results_df = pd.DataFrame({
     'IsHoliday': holdout_test_df['IsHoliday'].values,
@@ -621,12 +628,14 @@ def evaluate_sales_on_holdout(model_scm, eval_df, label):
     metrics = {
         "MAE": mean_absolute_error(y_true, y_pred),
         "RMSE": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "MAPE": custom_retail_mape(y_true, y_pred),
         "R2": r2_score(y_true, y_pred)
     }
 
     print(f"\n{label}")
     print(f"MAE:  {metrics['MAE']:.2f}")
     print(f"RMSE: {metrics['RMSE']:.2f}")
+    print(f"MAPE: {metrics['MAPE']:.2f}")
     print(f"R²:   {metrics['R2']:.4f}")
 
     return metrics
@@ -938,7 +947,7 @@ from whyshift.region_analysis import shared_reweight
 
 # [Sub-population Disagreement Analysis: Real vs Synthetic]
 # REAL - SYNTHETIC REGION ANALYSIS
-real_df = train_df.copy()
+real_df = source_df.copy()
 target_df = synthetic_dataset.copy()
 
 drop_cols = ['Weekly_Sales']
@@ -1069,7 +1078,7 @@ from whyshift.region_analysis import shared_reweight
 
 # [Sub-population Disagreement Analysis: Real vs Hybrid]
 # REAL - Hybrid REGION ANALYSIS
-real_df = df.copy()
+real_df = source_df.copy()
 target_df = hybrid_dataset.copy()
 
 drop_cols = ['Weekly_Sales']

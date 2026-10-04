@@ -23,14 +23,17 @@ import numpy as np
 from matplotlib import pyplot as plt
 import seaborn as sns
 import yaml
+import sys
+sys.path.append("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm")
+from custom_mape import custom_retail_mape
 with open("/home/it2022091/Structural-Causal-Model---Walmart-Dataset/scm/config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
 lgb_params = config["lgb_params"]
 
 CONFIG = {
-    'train_stores': list(range(1, 31)),  # Stores 1 to 30
-    'test_stores': list(range(31, 46)),  # Stores 31 to 45
+    'source_stores': list(range(1, 31)),  # Stores 1 to 30
+    'target_stores': list(range(31, 46)),  # Stores 31 to 45
     'random_seed': 42,
     'test_sample_size': 50000,
     'checkpoint_dir': './checkpoints_store_id',
@@ -77,22 +80,22 @@ print("PART 2: DOMAIN SHIFT SPLIT (STORES 1-30 vs 31-45)")
 
 
 # Split based on Store Number
-train_df = df[df['Store'].isin(CONFIG['train_stores'])].copy().reset_index(drop=True)
-test_df_full = df[df['Store'].isin(CONFIG['test_stores'])].copy().reset_index(drop=True)
+source_df = df[df['Store'].isin(CONFIG['source_stores'])].copy().reset_index(drop=True)
+target_df = df[df['Store'].isin(CONFIG['target_stores'])].copy().reset_index(drop=True)
 
 
 
 
 source_domain_train, source_domain_test = train_test_split(
-    train_df, test_size=0.1, random_state=42
+    source_df, test_size=0.1, random_state=42
 )
-target_domain_train , target_domain_test = train_test_split(test_df_full,test_size=0.9,random_state=42)
+target_domain_train , target_domain_test = train_test_split(target_df,test_size=0.9,random_state=42)
 
 train_df = pd.concat([source_domain_train, target_domain_train], axis=0).sample(frac=1, random_state=42)
-test_df_full = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
+test_df = pd.concat([source_domain_test, target_domain_test], axis=0).sample(frac=1, random_state=42)
 
-print(f"Train domain (Stores 1-30) shape: {train_df.shape}")
-print(f"\nTest domain (Stores 31-45)")
+print(f"Source Domain (Stores 1-30) shape: {train_df.shape}")
+print(f"\nTarget Domain (Stores 31-45)")
 
 
 print("✓ Domain separation verified: No overlap between Store Numbers")
@@ -116,7 +119,7 @@ try:
         if col not in categorical_cols_to_exclude:
             try:
                 train_df[col] = pd.to_numeric(train_df[col], errors='raise')
-                test_df_full[col] = pd.to_numeric(test_df_full[col], errors='raise')
+                test_df[col] = pd.to_numeric(test_df[col], errors='raise')
             except ValueError as e:
                 print(f"WARNING: Could not convert {col} to numeric: {e}")
 
@@ -125,14 +128,14 @@ try:
     for col in binary_nodes:
         if col in train_df.columns:
             train_df[col] = train_df[col].astype(int).astype(str)
-            test_df_full[col] = test_df_full[col].astype(int).astype(str)
+            test_df[col] = test_df[col].astype(int).astype(str)
 
     # Categorical encoding (Type is back as a standard feature!)
     categorical_nodes = ["Type", "weather_condition", "Dept", "city","Store"]
     for col in categorical_nodes:
         if col in train_df.columns:
             train_df[col] = train_df[col].astype(str)
-            test_df_full[col] = test_df_full[col].astype(str)
+            test_df[col] = test_df[col].astype(str)
 
     classifier_nodes = binary_nodes + categorical_nodes
     print(f"✓ Preprocessing complete (Classifier nodes: {len(classifier_nodes)})")
@@ -328,10 +331,10 @@ try:
     parents = sorted(list(feature_graph.predecessors("Weekly_Sales")))
 
     # Generate predictions
-    X_test = test_df_full[parents].to_numpy()
+    X_test = test_df[parents].to_numpy()
 
     train_features = parents
-    test_features = list(test_df_full[parents].columns)
+    test_features = list(test_df[parents].columns)
 
     missing = set(train_features) - set(test_features)
     extra = set(test_features) - set(train_features)
@@ -339,7 +342,7 @@ try:
     print("Missing:", missing)
     print("Extra:", extra)
 
-    if list(test_df_full[parents].columns) != parents:
+    if list(test_df[parents].columns) != parents:
         print("⚠️ Feature order mismatch!")
     else:
         print("✓ Feature order OK")
@@ -347,18 +350,21 @@ try:
     negative_percentage = (test_predictions < 0).mean() * 100
     print(negative_percentage)
     # Calculate metrics
-    mae = mean_absolute_error(test_df_full['Weekly_Sales'].values, test_predictions)
-    rmse = np.sqrt(mean_squared_error(test_df_full['Weekly_Sales'].values, test_predictions))
-    r2 = r2_score(test_df_full['Weekly_Sales'].values, test_predictions)
+    mae = mean_absolute_error(test_df['Weekly_Sales'].values, test_predictions)
+    rmse = np.sqrt(mean_squared_error(test_df['Weekly_Sales'].values, test_predictions))
+    r2 = r2_score(test_df['Weekly_Sales'].values, test_predictions)
+    mape = custom_retail_mape(test_df['Weekly_Sales'].values, test_predictions)
 
     print(f"\n=== PREDICTION METRICS (Test Set) ===")
     print(f"MAE:  {mae:.2f}")
     print(f"RMSE: {rmse:.2f}")
+    print(f"MAPE: {mape:.2f}")
     print(f"R²:   {r2:.4f}")
 
-    metrics_after_adaptation = {
+    metrics = {
         'MAE': mae,
         'RMSE': rmse,
+        'MAPE': mape,
         'R2': r2
     }
 
