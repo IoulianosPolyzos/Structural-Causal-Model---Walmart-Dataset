@@ -7,7 +7,7 @@ from sklearn.model_selection import learning_curve,TimeSeriesSplit
 
 
 
-def plot_sales_over_time(df, date_col='Date', target='Weekly_Sales'):
+def plot_sales_over_time(df, date_col='date', target='unit_sales'):
     temp = df.copy()
     temp[date_col] = pd.to_datetime(temp[date_col])
 
@@ -20,7 +20,7 @@ def plot_sales_over_time(df, date_col='Date', target='Weekly_Sales'):
     plt.ylabel("Sales")
     plt.show()
 
-def plot_monthly_seasonality(df, month_col='Month', target='Weekly_Sales'):
+def plot_monthly_seasonality(df, month_col='Month', target='unit_sales'):
     monthly = df.groupby(month_col)[target].mean()
 
     plt.figure(figsize=(10,5))
@@ -30,7 +30,7 @@ def plot_monthly_seasonality(df, month_col='Month', target='Weekly_Sales'):
     plt.ylabel("Avg Sales")
     plt.show()
 
-def plot_weekly_seasonality(df, week_col='WeekOfYear', target='Weekly_Sales'):
+def plot_weekly_seasonality(df, week_col='WeekOfYear', target='unit_sales'):
     weekly = df.groupby(week_col)[target].mean()
 
     plt.figure(figsize=(12,5))
@@ -49,7 +49,7 @@ def plot_correlation_heatmap(df):
     plt.title("Feature Correlation Heatmap")
     plt.show()
 
-def plot_top_categories(df, col, target='Weekly_Sales', top_n=10):
+def plot_top_categories(df, col, target='unit_sales', top_n=10):
     temp = df.groupby(col)[target].sum().sort_values(ascending=False).head(top_n)
 
     plt.figure(figsize=(10,5))
@@ -70,7 +70,7 @@ def plot_distribution(df, col):
 import matplotlib.pyplot as plt
 import pandas as pd
 
-def plot_split_bar(df, condition_col, target='Weekly_Sales',
+def plot_split_bar(df, condition_col, target='unit_sales',
                    train_name="Train", test_name="Test",
                    title="Split Analysis"):
     """
@@ -97,24 +97,24 @@ def plot_split_bar(df, condition_col, target='Weekly_Sales',
 
     plt.xticks(x, all_idx, rotation=45)
     plt.title(title)
-    plt.ylabel("Mean Weekly Sales")
+    plt.ylabel("Mean Unit Sales")
     plt.legend()
     plt.show()
 
 def plot_store_type_split(df):
     plot_split_bar(
         df,
-        condition_col="Type",
+        condition_col="store_type",
         title="Store Type Split (C train vs A/B test)"
     )
 def plot_store_number_split(df):
     df = df.copy()
-    df['store_group'] = df['Store'].apply(lambda x: "1-30" if x <= 30 else "31-45")
+    df['store_group'] = df['store_nbr'].apply(lambda x: "1-30" if x <= 30 else "31-54")
 
     plot_split_bar(
         df,
         condition_col="store_group",
-        title="Store Number Split (1-30 vs 31-45)"
+        title="Store Number Split (1-30 vs 31-54)"
     )
 def plot_holiday_split(df):
     plot_split_bar(

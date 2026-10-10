@@ -19,7 +19,7 @@ conda activate dowhy
 
 echo "Starting dataset preprocessing at: $(date)"
 
-python /home/it2022091/Structural-Causal-Model---Walmart-Dataset/walmart_dataset/main.py
+python /home/it2022091/Sales-Prediction---Distribution-Shifts---SCMs/walmart_dataset/main.py
 
 
 echo "Finished experiment at: $(date)"
