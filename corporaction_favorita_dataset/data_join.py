@@ -31,16 +31,44 @@ def create_master_dataset(nrows_train=None):
             with py7zr.SevenZipFile(archive_path, mode='r') as z:
                 z.extractall(path=data_dir)
 
-    print("2. Loading datasets into memory...")
-    # 'nrows_train' is used to limit rows for quick testing. Set to None to load the full dataset.
-    train = pd.read_csv(os.path.join(data_dir, 'train.csv'), parse_dates=['date'], nrows=nrows_train)
-    stores = pd.read_csv(os.path.join(data_dir, 'stores.csv'))
-    items = pd.read_csv(os.path.join(data_dir, 'items.csv'))
-    transactions = pd.read_csv(os.path.join(data_dir, 'transactions.csv'), parse_dates=['date'])
-    oil = pd.read_csv(os.path.join(data_dir, 'oil.csv'), parse_dates=['date'])
-    holidays = pd.read_csv(os.path.join(data_dir, 'holidays_events.csv'), parse_dates=['date'])
+    print("2. Converting CSV files to Parquet (if missing)...")
+    optimized_dtypes = {
+        'id': 'uint32', 'store_nbr': 'uint8', 'item_nbr': 'uint32',
+        'unit_sales': 'float32', 'onpromotion': 'object'
+    }
 
-    print("3. Cleaning and preparing individual datasets...")
+    for file in required_files:
+        csv_path = os.path.join(data_dir, file)
+        parquet_path = os.path.join(data_dir, file.replace('.csv', '.parquet'))
+
+        if not os.path.exists(parquet_path) and os.path.exists(csv_path):
+            print(f"  -> Converting {file} to Parquet...")
+
+            if file == 'train.csv':
+                df_temp = pd.read_csv(csv_path, dtype=optimized_dtypes, parse_dates=['date'])
+            else:
+                try:
+                    df_temp = pd.read_csv(csv_path, parse_dates=['date'])
+                except ValueError:  # Αν το αρχείο (π.χ. items.csv) δεν έχει ημερομηνία
+                    df_temp = pd.read_csv(csv_path)
+
+            df_temp.to_parquet(parquet_path, index=False)
+            del df_temp  # Free up RAM immediately after saving
+
+    print("3. Loading datasets from Parquet into memory...")
+    train = pd.read_parquet(os.path.join(data_dir, 'train.parquet'))
+
+    # Apply nrows_train limit if specified for quick testing
+    if nrows_train is not None:
+        train = train.head(nrows_train)
+
+    stores = pd.read_parquet(os.path.join(data_dir, 'stores.parquet'))
+    items = pd.read_parquet(os.path.join(data_dir, 'items.parquet'))
+    transactions = pd.read_parquet(os.path.join(data_dir, 'transactions.parquet'))
+    oil = pd.read_parquet(os.path.join(data_dir, 'oil.parquet'))
+    holidays = pd.read_parquet(os.path.join(data_dir, 'holidays_events.parquet'))
+
+    print("4. Cleaning and preparing individual datasets...")
     # Rename columns to avoid conflicts during merges
     stores.rename(columns={'type': 'store_type'}, inplace=True)
     holidays.rename(columns={'type': 'holiday_type'}, inplace=True)
@@ -52,7 +80,6 @@ def create_master_dataset(nrows_train=None):
     # Remove transferred holidays (they were celebrated on a different day)
     holidays_clean = holidays[holidays['transferred'] == False].copy()
 
-    print("4. Performing base merges...")
     # Left joins on the main train dataset
     df = train.merge(stores, on='store_nbr', how='left')
     df = df.merge(items, on='item_nbr', how='left')

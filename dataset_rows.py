@@ -1,12 +1,48 @@
 
-import csv
+import pandas as pd
+import time
 
-file_path = "final_data_walmart.csv"
+# ========================
+# PARQUET
+# ========================
+file_path_parquet = "final_data_favorita.parquet"
 
-with open(file_path, "r", encoding="utf-8-sig", newline="") as f:
-    reader = csv.reader(f)
+start = time.perf_counter()
+df_parquet = pd.read_parquet(file_path_parquet)
+parquet_time = time.perf_counter() - start
 
-    total_rows = sum(1 for row in reader)
+print("===== PARQUET =====")
+print(f"Rows: {len(df_parquet):,}")
+print(f"Columns: {len(df_parquet.columns)}")
+print(f"Read time: {parquet_time:.4f} seconds")
 
-print(f"Rows + header: {total_rows}")
-print(f"Rows - header: {max(0, total_rows - 1)}")
+
+# ========================
+# CSV
+# ========================
+file_path_csv = "final_data_favorita.csv"
+
+start = time.perf_counter()
+df_csv = pd.read_csv(file_path_csv)
+csv_time = time.perf_counter() - start
+
+print("\n===== CSV =====")
+print(f"Rows: {len(df_csv):,}")
+print(f"Columns: {len(df_csv.columns)}")
+print(f"Read time: {csv_time:.4f} seconds")
+
+
+# ========================
+# COMPARISON
+# ========================
+print("\n===== COMPARISON =====")
+print(f"CSV read time: {csv_time:.4f} seconds")
+print(f"Parquet read time: {parquet_time:.4f} seconds")
+
+if parquet_time > 0:
+    print(f"CSV / Parquet time ratio: {csv_time / parquet_time:.2f}x")
+
+if csv_time > 0:
+    print(f"Parquet is {(1 - parquet_time / csv_time) * 100:.2f}% faster than CSV"
+          if parquet_time < csv_time
+          else f"Parquet is {(parquet_time / csv_time - 1) * 100:.2f}% slower than CSV")

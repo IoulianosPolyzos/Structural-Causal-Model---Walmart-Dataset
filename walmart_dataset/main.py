@@ -226,3 +226,5 @@ if unnamed_columns:
 data.to_csv("final_data_walmart.csv",index=False,
     encoding="utf-8",
     float_format="%.4f")
+
+data.to_parquet("final_data_walmart.parquet", index=False)
