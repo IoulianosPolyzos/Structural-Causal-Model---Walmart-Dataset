@@ -3,7 +3,8 @@ import numpy as np
 import os
 import kagglehub
 import py7zr
-
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 def create_master_dataset(nrows_train=None):
     """
@@ -45,15 +46,25 @@ def create_master_dataset(nrows_train=None):
             print(f"  -> Converting {file} to Parquet...")
 
             if file == 'train.csv':
-                df_temp = pd.read_csv(csv_path, dtype=optimized_dtypes, parse_dates=['date'])
+                parquet_writer = None
+                for chunk in pd.read_csv(csv_path, dtype=optimized_dtypes, parse_dates=['date'], chunksize=5_000_000):
+                    table = pa.Table.from_pandas(chunk)
+
+                    if parquet_writer is None:
+                        parquet_writer = pq.ParquetWriter(parquet_path, table.schema)
+
+                    parquet_writer.write_table(table)
+
+                if parquet_writer is not None:
+                    parquet_writer.close()
             else:
                 try:
                     df_temp = pd.read_csv(csv_path, parse_dates=['date'])
-                except ValueError:  # Αν το αρχείο (π.χ. items.csv) δεν έχει ημερομηνία
+                except ValueError:
                     df_temp = pd.read_csv(csv_path)
 
-            df_temp.to_parquet(parquet_path, index=False)
-            del df_temp  # Free up RAM immediately after saving
+                df_temp.to_parquet(parquet_path, index=False)
+                del df_temp
 
     print("3. Loading datasets from Parquet into memory...")
     train = pd.read_parquet(os.path.join(data_dir, 'train.parquet'))
