@@ -211,3 +211,7 @@ if unnamed_columns:
 output_file = "final_data_favorita.csv"
 data.to_csv(output_file, index=False, encoding="utf-8", float_format="%.4f")
 print(f"Success! Final dataset saved to {output_file}")
+
+data.to_parquet("final_data_favorita.parquet", index=False)
+print(f"Success! Final parquet-dataset saved")
+
